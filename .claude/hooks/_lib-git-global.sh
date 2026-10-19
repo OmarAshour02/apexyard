@@ -5,8 +5,9 @@
 # push` (#1527). The gates used to require the verb in the next word after
 # `git`, so those forms skipped the check (#1730, #1731).
 #
-# Presence checks stay on the raw command. Do not strip quotes or heredoc
-# bodies before asking whether a commit or push is present (AgDR-0113).
+# Presence checks stay on the raw command unless a caller strips confirmed
+# heredoc bodies first for routing (AgDR-0113; refined by AgDR-0262 / #1780).
+# #1772: a redirection before the verb is skipped like the shell does.
 #
 # Not a hook. Hooks source this file.
 
@@ -26,7 +27,14 @@ _git_opt_val='(\\.|"[^"]*"|'"'"'[^'"'"']*'"'"'|\$\([^)]*\)|`[^`]*`|[^[:space:];&
 _git_q='("|'\'')*'
 # shellcheck disable=SC2089
 _git_cmd_word=${_git_q}'\\?[Gg]'${_git_q}'\\?[Ii]'${_git_q}'\\?[Tt]'${_git_q}
-_git_sub_opts='([[:space:]]+((-[Cc]|--(git-dir|work-tree|namespace|super-prefix|config-env|attr-source))[[:space:]]+'"${_git_opt_val}"'|--(git-dir|work-tree|namespace|super-prefix|config-env|attr-source)='"${_git_opt_val}"'|--?[A-Za-z][A-Za-z-]*(='"${_git_opt_val}"')?))*[[:space:]]+'
+# #1772 / #1805: a redirection before the verb is not the verb. Skip it the
+# same way the shell does. Longer operators come first (left-first ERE).
+# Use `[|]` for a literal pipe so ERE `|` does not break the group.
+# Keep the target as a simple token so this unit adds no nested groups.
+# Target is required so `git > push` does not treat `push` as the verb.
+_git_redir='[0-9]*(&>>|&>|>>|>[|]|&>|>&|>|<<<|<<-|<<|<&|<)[[:space:]]*[^[:space:];&|]+'
+# Spaces plus a unit, or a redirection glued to `git` (`git>file`).
+_git_sub_opts='(([[:space:]]+((-[Cc]|--(git-dir|work-tree|namespace|super-prefix|config-env|attr-source))[[:space:]]+'"${_git_opt_val}"'|--(git-dir|work-tree|namespace|super-prefix|config-env|attr-source)='"${_git_opt_val}"'|--?[A-Za-z][A-Za-z-]*(='"${_git_opt_val}"')?|'"${_git_redir}"')|'"${_git_redir}"'))*[[:space:]]+'
 _git_sub_re='(^|[^[:alnum:]_.-])'${_git_cmd_word}${_git_sub_opts}
 
 # Letter-quoted literal for a verb. Reuses the same quote grammar as the
@@ -193,13 +201,15 @@ EOF_LITERAL_MATCHES
 }
 
 # JSON-string pattern for raw_payload_command_matches.
-# Stays inside a JSON string. Covers the same global-option forms.
+# Stays inside a JSON string. Covers the same global-option and redirect forms.
 git_subcommand_payload_pattern() {
   local sub="$1" lit
   # #1748: a JSON-escaped double-quoted value (-C \"a b\") or a single-quoted
   # value (-C 'a b') is one option word. Single quotes need no JSON escape.
   # #1816: command word may be quoted / another case; verb may be letter-quoted.
+  # #1772: redirections before the verb match the shared grammar.
   # A complex $sub (alias no-jq alternation) stays raw.
+  local jredir='[0-9]*(&>>|&>|>>|>[|]|&>|>&|>|<<<|<<-|<<|<&|<)[[:space:]]*[^"\\[:space:]]+'
   local _git_payload_val='(\\"([^"\\]|\\[^"])*\\"|'"'"'[^'"'"']*'"'"'|\\.|[^"'"'"'\\[:space:]])+'
   if [[ "$sub" =~ ^[a-z0-9-]+$ ]]; then
     lit=$(_git_quoted_literal "$sub")
@@ -207,7 +217,7 @@ git_subcommand_payload_pattern() {
     lit=$sub
   fi
   # shellcheck disable=SC2090
-  printf '%s' ${_git_cmd_word}'([[:space:]]+((-[Cc]|--(git-dir|work-tree|namespace|super-prefix|config-env|attr-source))[[:space:]]+'"${_git_payload_val}"'|--?[A-Za-z][A-Za-z-]*(='"${_git_payload_val}"')?))*[[:space:]]+'${lit}'([^[:alnum:]_.-]|$)'
+  printf '%s' ${_git_cmd_word}'(([[:space:]]+((-[Cc]|--(git-dir|work-tree|namespace|super-prefix|config-env|attr-source))[[:space:]]+'"${_git_payload_val}"'|--?[A-Za-z][A-Za-z-]*(='"${_git_payload_val}"')?|'"${jredir}"')|'"${jredir}"'))*[[:space:]]+'${lit}'([^[:alnum:]_.-]|$)'
 }
 
 # 2 when the token takes the next token as its value.
@@ -257,6 +267,27 @@ _git_take_value() {
       ;;
   esac
   [ -n "$_GIT_TAKEN" ]
+}
+
+# Consume one redirection from $_GIT_SCAN (#1772).
+# Returns 1 when the next token is not a redirection.
+_git_take_redir() {
+  local re='^([0-9]*)(&>>|&>|>>|>[|]|&>|>&|>|<<<|<<-|<<|<&|<)'
+  [[ "$_GIT_SCAN" =~ $re ]] || return 1
+  _GIT_SCAN="${_GIT_SCAN:${#BASH_REMATCH[0]}}"
+  _GIT_SCAN="${_GIT_SCAN#"${_GIT_SCAN%%[![:space:]]*}"}"
+  # A bare operator with no target is still a redirection token.
+  [ -n "$_GIT_SCAN" ] || return 0
+  case "$_GIT_SCAN" in
+    [\;\&\|]|[\;\&\|]*) return 0 ;;
+  esac
+  # Digit-only target for >&1 / <&0 / >&- forms.
+  if [[ "$_GIT_SCAN" =~ ^([0-9]+|-) ]]; then
+    _GIT_SCAN="${_GIT_SCAN:${#BASH_REMATCH[0]}}"
+    return 0
+  fi
+  _git_take_value || return 0
+  return 0
 }
 
 # Consume one global option from $_GIT_SCAN.
@@ -326,8 +357,9 @@ _git_strip_cmd_word() {
   return 1
 }
 
-# Walk global options in $_GIT_SCAN until <sub>.
+# Walk global options and redirections in $_GIT_SCAN until <sub>.
 # On success, $_GIT_SCAN is the text after that subcommand.
+# #1772: skip redirections the same way the shell does.
 # #1816 G5: decode a quoted or partly quoted verb with _git_take_value.
 # Keep the trailing-boundary case so a match like `git push` (with a closing
 # backtick) still finds the verb.
@@ -346,6 +378,10 @@ _git_scan_globals() {
         return 0
         ;;
     esac
+    # Glued or spaced redirection before the verb (#1772).
+    if _git_take_redir; then
+      continue
+    fi
     saved="$_GIT_SCAN"
     if _git_take_value; then
       word="$_GIT_TAKEN"
