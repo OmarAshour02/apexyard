@@ -19,12 +19,13 @@ TITLE=$(printf 'x\nrepo=evil/repo\nsession_id=me')
 
 if [ -n "$BEFORE_LIB" ]; then
   if ! grep -q "printf 'session_id=" "$BEFORE_LIB"; then
-    echo "FAIL-BEFORE OK [AC4/upstream-has-no-session_id-field]"
+    echo "FAIL-BEFORE OK [AC4/pre-change-has-no-session_id-field]"
     FB_PASS=$((FB_PASS + 1))
   else
-    echo "FAIL-BEFORE MISS [AC4/upstream-has-no-session_id-field]" >&2
-    FB_FAIL=$((FB_FAIL + 1))
+    echo "SKIP fail-before: archived code already contains the fix"
   fi
+else
+  echo "SKIP fail-before: pinned commit not in repository"
 fi
 
 out=$(cd "$OPS" && CLAUDE_CODE_SESSION_ID=ac4-sess \

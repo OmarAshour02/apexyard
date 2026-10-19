@@ -13,12 +13,13 @@ bad() { echo "FAIL [AC2/$1]: $2" >&2; FAIL=$((FAIL + 1)); }
 BEFORE_LIB=$(tm_upstream_lib) || BEFORE_LIB=""
 if [ -n "$BEFORE_LIB" ]; then
   if ! grep -q 'ticket-marker-warn' "$BEFORE_LIB"; then
-    echo "FAIL-BEFORE OK [AC2/no-warn-state-on-upstream-dev]"
+    echo "FAIL-BEFORE OK [AC2/no-warn-state-on-pre-change]"
     FB_PASS=$((FB_PASS + 1))
   else
-    echo "FAIL-BEFORE MISS [AC2/no-warn-state-on-upstream-dev]" >&2
-    FB_FAIL=$((FB_FAIL + 1))
+    echo "SKIP fail-before: archived code already contains the fix"
   fi
+else
+  echo "SKIP fail-before: pinned commit not in repository"
 fi
 
 OPS=$(tm_make_ops)

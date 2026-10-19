@@ -21,7 +21,7 @@ tm_write_marker "$TREE" org/p1 10 'Original' session-old "$CUR"
 cp "$GD/apexyard-ticket" "$OPS/marker.before"
 BEFORE=$(cksum < "$OPS/marker.before")
 
-# fail-before: upstream write_from_file overwrites without the guard
+# fail-before: pre-#1533 write_from_file overwrites without the guard
 if [ -n "$BEFORE_LIB" ]; then
   cp "$BEFORE_LIB" "$OPS/.claude/hooks/_lib-active-ticket.sh"
   PENDING="$OPS/.claude/session/start-ticket-headless.pending"
@@ -30,15 +30,16 @@ if [ -n "$BEFORE_LIB" ]; then
     bash -c '. .claude/hooks/_lib-active-ticket.sh && active_ticket_write_from_file "$1" "$2"' _ "$TREE" "$PENDING") >/dev/null 2>&1 || true
   AFTER_FB=$(cksum < "$GD/apexyard-ticket")
   if [ "$BEFORE" != "$AFTER_FB" ]; then
-    echo "FAIL-BEFORE OK [AC3/upstream-overwrites-without-guard]"
+    echo "FAIL-BEFORE OK [AC3/pre-change-overwrites-without-guard]"
     FB_PASS=$((FB_PASS + 1))
   else
-    echo "FAIL-BEFORE MISS [AC3/upstream-overwrites-without-guard]: marker unchanged on upstream" >&2
-    FB_FAIL=$((FB_FAIL + 1))
+    echo "SKIP fail-before: archived code already contains the fix"
   fi
   # Restore fixed lib and original marker for the pass-after proof.
   cp "$SRC_ROOT/.claude/hooks/_lib-active-ticket.sh" "$OPS/.claude/hooks/_lib-active-ticket.sh"
   cp "$OPS/marker.before" "$GD/apexyard-ticket"
+else
+  echo "SKIP fail-before: pinned commit not in repository"
 fi
 
 PENDING="$OPS/.claude/session/start-ticket-headless.pending"

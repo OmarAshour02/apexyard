@@ -9,11 +9,23 @@ tm_src_root() {
   printf '%s\n' "$TM_SRC_ROOT"
 }
 
+# Pre-#1533 _lib-active-ticket.sh (parent of b4080e3 / PR #1794). Pin a
+# literal SHA — never upstream/dev or origin/dev (those hold the fix after
+# merge). Override with APEXYARD_TM_BEFORE_SHA or APEXYARD_TM_BEFORE_DIR.
 tm_upstream_lib() {
-  local root
+  local root sha dir out
   root=$(tm_src_root)
-  if git -C "$root" show upstream/dev:.claude/hooks/_lib-active-ticket.sh >/tmp/apexyard-1533-before-lib.sh 2>/dev/null; then
-    printf '%s\n' /tmp/apexyard-1533-before-lib.sh
+  dir="${APEXYARD_TM_BEFORE_DIR:-}"
+  sha="${APEXYARD_TM_BEFORE_SHA:-d970c194b0ff5e14aac71d486c32dd3aa976d78a}"
+  out="${TMPDIR:-/tmp}/apexyard-1533-before-lib.sh"
+  if [ -n "$dir" ] && [ -f "$dir/_lib-active-ticket.sh" ]; then
+    cp "$dir/_lib-active-ticket.sh" "$out"
+    printf '%s\n' "$out"
+    return 0
+  fi
+  if git -C "$root" cat-file -e "$sha^{commit}" 2>/dev/null \
+    && git -C "$root" show "$sha:.claude/hooks/_lib-active-ticket.sh" > "$out" 2>/dev/null; then
+    printf '%s\n' "$out"
     return 0
   fi
   return 1

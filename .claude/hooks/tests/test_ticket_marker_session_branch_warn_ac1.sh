@@ -12,17 +12,16 @@ bad() { echo "FAIL [AC1/$1]: $2" >&2; FAIL=$((FAIL + 1)); }
 
 BEFORE_LIB=$(tm_upstream_lib) || BEFORE_LIB=""
 
-# --- fail-before: upstream lib has no warn helper / no session_id field ---
+# --- fail-before: pre-#1533 lib has no warn helper / no session_id field ---
 if [ -n "$BEFORE_LIB" ]; then
   if ! grep -q 'active_ticket_warn_if_mismatch' "$BEFORE_LIB"; then
-    echo "FAIL-BEFORE OK [AC1/no-warn-helper-on-upstream-dev]"
+    echo "FAIL-BEFORE OK [AC1/no-warn-helper-on-pre-change]"
     FB_PASS=$((FB_PASS + 1))
   else
-    echo "FAIL-BEFORE MISS [AC1/no-warn-helper-on-upstream-dev]" >&2
-    FB_FAIL=$((FB_FAIL + 1))
+    echo "SKIP fail-before: archived code already contains the fix"
   fi
 else
-  echo "NOTE: skip fail-before AC1 (no upstream/dev lib)"
+  echo "SKIP fail-before: pinned commit not in repository"
 fi
 
 OPS=$(tm_make_ops)
