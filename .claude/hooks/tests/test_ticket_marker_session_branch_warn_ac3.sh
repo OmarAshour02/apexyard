@@ -33,13 +33,13 @@ if [ -n "$BEFORE_LIB" ]; then
     echo "FAIL-BEFORE OK [AC3/pre-change-overwrites-without-guard]"
     FB_PASS=$((FB_PASS + 1))
   else
-    echo "SKIP fail-before: archived code already contains the fix"
+    echo "NOTE: skip fail-before: archived code already contains the fix"
   fi
   # Restore fixed lib and original marker for the pass-after proof.
   cp "$SRC_ROOT/.claude/hooks/_lib-active-ticket.sh" "$OPS/.claude/hooks/_lib-active-ticket.sh"
   cp "$OPS/marker.before" "$GD/apexyard-ticket"
 else
-  echo "SKIP fail-before: pinned commit not in repository"
+  echo "NOTE: skip fail-before: pinned commit not in repository"
 fi
 
 PENDING="$OPS/.claude/session/start-ticket-headless.pending"

@@ -19,10 +19,10 @@ if [ -n "$BEFORE_LIB" ]; then
     echo "FAIL-BEFORE OK [AC7/pre-change-has-no-branch-field]"
     FB_PASS=$((FB_PASS + 1))
   else
-    echo "SKIP fail-before: archived code already contains the fix"
+    echo "NOTE: skip fail-before: archived code already contains the fix"
   fi
 else
-  echo "SKIP fail-before: pinned commit not in repository"
+  echo "NOTE: skip fail-before: pinned commit not in repository"
 fi
 
 # Readers used by block-ambient and status briefing take the first key.
