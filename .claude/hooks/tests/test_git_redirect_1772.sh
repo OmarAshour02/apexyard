@@ -44,7 +44,8 @@ BASE_HOOKS="${REDIRECT_1772_BASE_HOOKS:-}"
 if [ -z "$BASE_HOOKS" ]; then
   BASE_REF="${REDIRECT_1772_BASE_REF:-}"
   if [ -z "$BASE_REF" ]; then
-    first_1805=$(git -C "$ROOT" log --reverse --format=%H --fixed-strings --grep='#1805' -1 2>/dev/null || true)
+    # Oldest #1805 commit's parent (git log -1 + --reverse is not oldest).
+    first_1805=$(git -C "$ROOT" log --reverse --format=%H --fixed-strings --grep='#1805' 2>/dev/null | head -1 || true)
     if [ -n "$first_1805" ]; then
       BASE_REF=$(git -C "$ROOT" rev-parse "${first_1805}^")
     else
