@@ -44,18 +44,43 @@ if [ -z "$COMMAND" ]; then
   exit 0
 fi
 
+# #1810 / AgDR-0259: a quoted heredoc body is data. Presence, newline-compound,
+# and backtick scans use the same stripped route text as push/commit routing
+# (AgDR-0262). Message extraction and the heredoc-substitution skip still
+# read the raw command so `$(cat <<…)` shapes stay visible.
+_SCAN_CMD="$COMMAND"
+if [ -n "${APEXYARD_GIT_ROUTE_CMD+set}" ]; then
+  _SCAN_CMD="$APEXYARD_GIT_ROUTE_CMD"
+elif [ -r "$HOOK_DIR/_lib-strip-heredoc.sh" ]; then
+  if ! declare -F strip_heredoc_bodies >/dev/null 2>&1; then
+    # shellcheck source=/dev/null
+    . "$HOOK_DIR/_lib-strip-heredoc.sh" || {
+      echo "BLOCKED: commit-format hook cannot load the heredoc stripper." >&2
+      exit 2
+    }
+  fi
+  if ! declare -F strip_heredoc_bodies >/dev/null 2>&1; then
+    echo "BLOCKED: commit-format hook cannot load the heredoc stripper." >&2
+    exit 2
+  fi
+  if ! _SCAN_CMD=$(strip_heredoc_bodies "$COMMAND" quoted); then
+    echo "BLOCKED: commit-format hook cannot strip quoted heredoc bodies." >&2
+    exit 2
+  fi
+fi
+
 if command -v command_has_git_subcommand >/dev/null 2>&1; then
-  command_has_git_subcommand "$COMMAND" commit || exit 0
-elif ! echo "$COMMAND" | grep -qE '\bgit\s+commit\b'; then
+  command_has_git_subcommand "$_SCAN_CMD" commit || exit 0
+elif ! printf '%s\n' "$_SCAN_CMD" | grep -qE '\bgit\s+commit\b'; then
   exit 0
 fi
 
-if [[ "$COMMAND" =~ $'\n'[[:space:]]*git[[:space:]]+commit ]]; then
+if [[ "$_SCAN_CMD" =~ $'\n'[[:space:]]*git[[:space:]]+commit ]]; then
   echo "BLOCKED: commit-format hook does not accept newline compound commit commands." >&2
   exit 2
 fi
 
-if printf '%s' "$COMMAND" | grep -qF "$(printf '\140')"; then
+if printf '%s' "$_SCAN_CMD" | grep -qF "$(printf '\140')"; then
   echo "BLOCKED: commit-format hook does not accept backtick command substitutions." >&2
   exit 2
 fi

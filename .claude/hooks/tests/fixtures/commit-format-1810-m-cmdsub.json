@@ -1,0 +1,5 @@
+{
+  "tool_input": {
+    "command": "git commit -m \"fix: subject $(echo hi)\""
+  }
+}

@@ -28,10 +28,14 @@ set -u
 . "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
 
 
-SRC_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+SRC_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../../.." && pwd)"
 HOOK_SRC="$SRC_ROOT/.claude/hooks/validate-commit-format.sh"
 LIB_CFG="$SRC_ROOT/.claude/hooks/_lib-read-config.sh"
+LIB_STRIP="$SRC_ROOT/.claude/hooks/_lib-strip-heredoc.sh"
 DEFAULTS="$SRC_ROOT/.claude/project-config.defaults.json"
+FIXTURES="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/fixtures"
+# Pre-#1805 / pre-#1810 tip: commit-format still scanned raw heredoc bodies.
+PINNED_BEFORE_SHA="e48bbc49125dc2a7e80c2945c7c6e42fe42f4486"
 
 if [ ! -x "$HOOK_SRC" ]; then
   echo "FAIL: hook not found or not executable at $HOOK_SRC" >&2
@@ -57,6 +61,7 @@ make_sandbox() {
   mkdir -p "$sb/.claude/hooks"
   cp "$HOOK_SRC" "$sb/.claude/hooks/validate-commit-format.sh"
   if [ -f "$LIB_CFG" ]; then cp "$LIB_CFG" "$sb/.claude/hooks/_lib-read-config.sh"; fi
+  if [ -f "$LIB_STRIP" ]; then cp "$LIB_STRIP" "$sb/.claude/hooks/_lib-strip-heredoc.sh"; fi
   if [ -f "$DEFAULTS" ]; then cp "$DEFAULTS" "$sb/.claude/project-config.defaults.json"; fi
   chmod +x "$sb/.claude/hooks/validate-commit-format.sh"
   echo "$sb"
@@ -221,6 +226,113 @@ run_case "no heredoc-substitution: bad subject still blocks" \
 # Non-commit command → no-op.
 run_case "non-commit command exits 0 silently" \
   "git status" 0 ""
+
+# -- #1810: quoted heredoc body is data; real commits still checked --------
+
+run_case_from_fixture() {
+  local label="$1" fixture="$2" want_rc="$3" want_stderr_regex="$4"
+  local sb; sb=$(make_sandbox)
+  local got_stderr got_rc
+  got_stderr=$(cd "$sb" && bash .claude/hooks/validate-commit-format.sh < "$fixture" 2>&1 >/dev/null)
+  got_rc=$?
+  rm -rf "$sb"
+
+  if [ "$got_rc" != "$want_rc" ]; then
+    echo "FAIL [$label]: want rc=$want_rc, got $got_rc" >&2
+    echo "    stderr: ${got_stderr:0:300}" >&2
+    FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}${label} "
+    return
+  fi
+  if [ -n "$want_stderr_regex" ] && ! echo "$got_stderr" | grep -qE "$want_stderr_regex"; then
+    echo "FAIL [$label]: stderr did not match /$want_stderr_regex/" >&2
+    echo "    stderr: $got_stderr" >&2
+    FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}${label} "
+    return
+  fi
+  echo "PASS [$label]"
+  PASS=$((PASS+1))
+}
+
+# File-writing quoted heredoc with Markdown backticks (and a git commit
+# mention in the body) must not be blocked by commit-format.
+run_case_from_fixture "1810 file-write heredoc with backticks: pass" \
+  "$FIXTURES/commit-format-1810-filewrite-backticks.json" 0 ""
+
+# A real commit whose -m holds a command substitution still blocks.
+run_case_from_fixture "1810 -m with \$(…) command substitution: block" \
+  "$FIXTURES/commit-format-1810-m-cmdsub.json" 2 \
+  "does not accept command substitutions"
+
+run_case_from_fixture "1810 -m with backtick command substitution: block" \
+  "$FIXTURES/commit-format-1810-m-backtick-sub.json" 2 \
+  "backtick command substitutions"
+
+# A message read from a file is still checked as today.
+run_case_F_file() {
+  local label="1810 git commit -F bad subject: block"
+  local sb; sb=$(make_sandbox)
+  cp "$FIXTURES/commit-format-1810-F-bad-subject.txt" "$sb/msg.txt"
+  local input got_stderr got_rc
+  input=$(jq -nc --arg c "git commit -F msg.txt" '{tool_input:{command:$c}}')
+  got_stderr=$(cd "$sb" && echo "$input" | bash .claude/hooks/validate-commit-format.sh 2>&1 >/dev/null)
+  got_rc=$?
+  rm -rf "$sb"
+  if [ "$got_rc" != 2 ] || ! echo "$got_stderr" | grep -qE 'BLOCKED: Commit subject'; then
+    echo "FAIL [$label]: want rc=2 and subject block, got rc=$got_rc stderr=${got_stderr:0:300}" >&2
+    FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}${label} "
+    return
+  fi
+  echo "PASS [$label]"
+  PASS=$((PASS+1))
+}
+run_case_F_file
+
+# Fail-before: pinned pre-#1805 tip still blocks the file-write fixture.
+fail_before_1810() {
+  local label="1810 fail-before pinned tip blocks file-write backticks"
+  if ! git -C "$SRC_ROOT" cat-file -e "${PINNED_BEFORE_SHA}^{commit}" 2>/dev/null; then
+    echo "SKIP fail-before: pinned commit ${PINNED_BEFORE_SHA} missing"
+    return
+  fi
+  local scratch before_hook
+  scratch=$(mktemp -d)
+  if ! git -C "$SRC_ROOT" archive "$PINNED_BEFORE_SHA" \
+      .claude/hooks/validate-commit-format.sh \
+      .claude/hooks/_lib-strip-heredoc.sh \
+      2>/dev/null | tar -x -C "$scratch"; then
+    echo "SKIP fail-before: cannot archive hooks from ${PINNED_BEFORE_SHA}"
+    rm -rf "$scratch"
+    return
+  fi
+  before_hook="$scratch/.claude/hooks/validate-commit-format.sh"
+  if grep -q 'APEXYARD_GIT_ROUTE_CMD\|_SCAN_CMD' "$before_hook" 2>/dev/null; then
+    echo "SKIP fail-before: pinned hook already contains the #1810 scan path"
+    rm -rf "$scratch"
+    return
+  fi
+  local sb got_rc
+  sb=$(mktemp -d)
+  mkdir -p "$sb/.claude/hooks"
+  cp "$before_hook" "$sb/.claude/hooks/validate-commit-format.sh"
+  if [ -f "$scratch/.claude/hooks/_lib-strip-heredoc.sh" ]; then
+    cp "$scratch/.claude/hooks/_lib-strip-heredoc.sh" "$sb/.claude/hooks/_lib-strip-heredoc.sh"
+  fi
+  chmod +x "$sb/.claude/hooks/validate-commit-format.sh"
+  set +e
+  bash "$sb/.claude/hooks/validate-commit-format.sh" \
+    < "$FIXTURES/commit-format-1810-filewrite-backticks.json" >/dev/null 2>&1
+  got_rc=$?
+  set -e
+  rm -rf "$sb" "$scratch"
+  if [ "$got_rc" -ne 2 ]; then
+    echo "FAIL [$label]: want rc=2 on pinned tip, got $got_rc" >&2
+    FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}${label} "
+    return
+  fi
+  echo "PASS [$label]"
+  PASS=$((PASS+1))
+}
+fail_before_1810
 
 # ---- Summary ------------------------------------------------------------
 

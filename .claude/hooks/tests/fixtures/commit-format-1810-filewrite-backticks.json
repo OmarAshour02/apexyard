@@ -1,0 +1,5 @@
+{
+  "tool_input": {
+    "command": "cat > /tmp/review-1810.md <<'EOF'\nReview SHA: `abc123`\nDo not run `git commit` here.\nEOF\n"
+  }
+}

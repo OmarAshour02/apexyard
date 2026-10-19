@@ -1,0 +1,5 @@
+{
+  "tool_input": {
+    "command": "git commit -m \"fix: valid subject\" `git commit -m \"invalid subject\"`"
+  }
+}
