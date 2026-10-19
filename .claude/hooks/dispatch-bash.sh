@@ -494,12 +494,11 @@ esac
 # the subcommand, so `git push;`, `git push&&` and `(git push)` also route.
 #
 # The scan adds routing when its join succeeds. If awk fails, run the push
-# and commit gates unconditionally. The scan does not scrub
-# quoted data, so text that only mentions a push or commit (a heredoc body,
-# an echo, a commit message) also routes. That over-match can cause a false
-# block from a gate that refuses compound commands. A real compound commit
-# such as `git add a && git commit ...` reaches validate-commit-format.sh,
-# which refuses it, as it did before the dispatcher existed.
+# and commit gates unconditionally. #1780 / AgDR-0262: strip confirmed
+# quoted heredoc bodies before push/commit routing so prose mentions do
+# not start those gates. Keep the raw command for the merge-shape scan and
+# for the alias check. If the strip fails, run both gate groups (fail
+# closed). Unquoted heredocs and here-strings are not stripped here.
 #
 # Line continuations are joined first, because grep reads one line at a
 # time and `git \<newline> push` would otherwise put git and push on
@@ -546,10 +545,34 @@ fi
 if ! command -v command_has_git_subcommand >/dev/null 2>&1; then
   _scan_failed=1
 fi
+# #1780: strip quoted heredoc bodies before alias check and push/commit
+# routing. Raw COMMAND stays for merge-shape matching below.
+if [ "$_scan_failed" -eq 0 ]; then
+  if [ -r "$HOOK_DIR/_lib-strip-heredoc.sh" ]; then
+    # shellcheck source=/dev/null
+    . "$HOOK_DIR/_lib-strip-heredoc.sh"
+    if ! declare -F strip_heredoc_bodies >/dev/null 2>&1; then
+      _scan_failed=1
+    elif ! _scan_cmd=$(strip_heredoc_bodies "$_scan_cmd" quoted); then
+      _scan_failed=1
+    else
+      # Share one stripped route text with the push/commit gates (#1780).
+      export APEXYARD_GIT_ROUTE_CMD="$_scan_cmd"
+    fi
+  else
+    _scan_failed=1
+  fi
+fi
 if [ "$_alias_library_loaded" = 1 ] && command -v git_alias_check >/dev/null 2>&1; then
   # cmd and cwd are read by git_alias_check in this shell.
+  # Prefer the stripped route text so quoted heredoc prose is not scanned
+  # (#1780). Fall back to the raw command when the strip failed closed.
   # shellcheck disable=SC2034
-  cmd="$COMMAND"
+  if [ "$_scan_failed" -eq 0 ]; then
+    cmd="$_scan_cmd"
+  else
+    cmd="$COMMAND"
+  fi
   # shellcheck disable=SC2034
   cwd=$(jq -r '.cwd // .tool_input.cwd // empty' <<<"$INPUT" 2>/dev/null) || cwd=""
   git_alias_check push commit || exit 2

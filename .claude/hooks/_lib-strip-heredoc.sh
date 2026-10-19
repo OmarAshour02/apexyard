@@ -93,8 +93,16 @@
 #
 # Returns: prints the command with CONFIRMED heredoc bodies removed. Always
 # exits 0.
+#
+# Optional second argument:
+#   all     (default) — strip every confirmed heredoc
+#   quoted  — strip only heredocs whose delimiter is quoted (`<<'EOF'` /
+#             `<<"EOF"`). Used by the dispatcher for push/commit routing
+#             (#1780 / AgDR-0262). Unquoted heredocs and here-strings keep
+#             today's checks.
 strip_heredoc_bodies() {
   local cmd="$1"
+  local mode="${2:-all}"
   local -a lines=()
   local line
   while IFS= read -r line || [ -n "$line" ]; do
@@ -136,6 +144,14 @@ strip_heredoc_bodies() {
     if [ -z "$marker" ]; then
       i=$((i + 1))
       continue
+    fi
+
+    # #1780: routing may ask for quoted delimiters only.
+    if [ "$mode" = quoted ]; then
+      case "$marker" in
+        *\'*|*\") ;;
+        *) i=$((i + 1)); continue ;;
+      esac
     fi
 
     # --- Anchor check -------------------------------------------------

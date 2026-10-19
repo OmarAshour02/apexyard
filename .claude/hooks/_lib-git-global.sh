@@ -445,8 +445,8 @@ _git_resolve_dir() {
   printf '%s' "$dir"
 }
 
-# Print chain segments. Keep separators inside quotes in the same segment.
-_git_chain_segments() {
+# Bash fallback for _git_chain_segments (#1780). Linear awk is preferred.
+_git_chain_segments_bash() {
   local text="$1" part="" quote="" char i escaped=0
   for ((i=0; i<${#text}; i++)); do
     char="${text:i:1}"
@@ -486,6 +486,82 @@ _git_chain_segments() {
   printf '%s\n' "$part"
 }
 
+# Print chain segments. Keep separators inside quotes in the same segment.
+# #1780: one awk pass (linear). Cap length and fail closed instead of a timeout.
+# Cache the last result when the command text matches.
+_GIT_CHAIN_SEGMENTS_MAX="${_GIT_CHAIN_SEGMENTS_MAX:-65536}"
+_git_chain_segments() {
+  local text="$1" out
+  if [ "${#text}" -gt "$_GIT_CHAIN_SEGMENTS_MAX" ]; then
+    echo "BLOCKED: command text is too long (${#text} bytes) to scan for directory changes. Write the body to a file and pass -F or --body-file." >&2
+    return 2
+  fi
+  if [ "${_GIT_SEGMENTS_CMD-}" = "$text" ] && [ "${_GIT_SEGMENTS_CACHE+set}" = set ]; then
+    printf '%s' "$_GIT_SEGMENTS_CACHE"
+    return 0
+  fi
+  if ! command -v _run_awk_or_fallback >/dev/null 2>&1; then
+    # shellcheck source=/dev/null
+    . "$(dirname "${BASH_SOURCE[0]}")/_lib-awk-fallback.sh" 2>/dev/null || {
+      out=$(_git_chain_segments_bash "$text") || return 2
+      _GIT_SEGMENTS_CMD="$text"
+      _GIT_SEGMENTS_CACHE="$out"
+      printf '%s' "$out"
+      return 0
+    }
+  fi
+  # RS is the appended sentinel from _run_awk_or_fallback. One record = whole text.
+  if ! out=$(LC_ALL=C _run_awk_or_fallback "$text" _git_chain_segments_bash '
+    BEGIN {
+      sq = sprintf("%c", 39)
+      dq = sprintf("%c", 34)
+      RS = "\034"
+      ORS = ""
+    }
+    {
+      text = $0
+      n = length(text)
+      part = ""
+      quote = ""
+      escaped = 0
+      for (i = 1; i <= n; i++) {
+        char = substr(text, i, 1)
+        if (escaped) { part = part char; escaped = 0; continue }
+        if (char == "\\" && quote != sq) { part = part char; escaped = 1; continue }
+        if (quote != "") {
+          part = part char
+          if (char == quote) quote = ""
+          continue
+        }
+        if (char == dq || char == sq) { quote = char; part = part char; continue }
+        if (char == "&") {
+          prev = (length(part) ? substr(part, length(part), 1) : "")
+          nextc = (i < n ? substr(text, i + 1, 1) : "")
+          if (prev == ">" || prev == "<" || nextc == ">") { part = part char; continue }
+          if (nextc == "&") i++
+          else part = part " __git_background__"
+          printf "%s\n", part
+          part = ""
+          continue
+        }
+        if (char == ";" || char == "\n") {
+          printf "%s\n", part
+          part = ""
+          continue
+        }
+        part = part char
+      }
+      printf "%s\n", part
+    }
+  '); then
+    return 2
+  fi
+  _GIT_SEGMENTS_CMD="$text"
+  _GIT_SEGMENTS_CACHE="$out"
+  printf '%s' "$out"
+  return 0
+}
+
 # Track literal cd commands before the selected invocation.
 # Reject unresolved targets without executing command text.
 _git_chain_cwd() {
@@ -498,7 +574,7 @@ _git_chain_cwd() {
   _GIT_CHAIN_CHANGED=0
   # Capture first. A POSIX-sourced lib must not use process substitution.
   # Read from fd 3 to keep commands from consuming the segment list.
-  segments=$(_git_chain_segments "$cmd")
+  segments=$(_git_chain_segments "$cmd") || return 2
   while IFS= read -r segment <&3; do
     segment="${segment#"${segment%%[![:space:]]*}"}"
     prefix="$segment"
@@ -615,21 +691,57 @@ git_invocation_prefixes() {
   done
 }
 
-# Check each raw invocation in a separate subshell. Keep the full command.
-# Resolve the cd chain separately for each selected invocation.
+# Check each real invocation in a separate subshell.
+# #1780: strip quoted heredoc bodies before matching so prose mentions are
+# not visited. Fail closed in block mode when the stripper cannot run.
+# Resolve the cd chain separately for each selected invocation. Segment the
+# command once (cached inside _git_chain_segments).
 git_visit_invocations() {
   local callback="$1" mode="$2" input="$3"
   shift 3
-  local cmd cwd sub prefix rc count=0 arg index
+  local cmd cwd sub prefix rc count=0 arg index raw_cmd
   cmd=$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null)
   cwd=$(printf '%s' "$input" | jq -r '.cwd // .tool_input.cwd // empty' 2>/dev/null)
+  raw_cmd="$cmd"
+  # Prefer the dispatcher route text when present (one strip per Bash call).
+  if [ -n "${APEXYARD_GIT_ROUTE_CMD+set}" ]; then
+    cmd="$APEXYARD_GIT_ROUTE_CMD"
+  else
+    if ! declare -F strip_heredoc_bodies >/dev/null 2>&1; then
+      # shellcheck source=/dev/null
+      if [ -f "$(dirname "${BASH_SOURCE[0]}")/_lib-strip-heredoc.sh" ]; then
+        . "$(dirname "${BASH_SOURCE[0]}")/_lib-strip-heredoc.sh" || true
+      fi
+    fi
+    if declare -F strip_heredoc_bodies >/dev/null 2>&1; then
+      if ! cmd=$(strip_heredoc_bodies "$raw_cmd" quoted); then
+        if [ "$mode" = block ]; then
+          echo "BLOCKED: cannot strip quoted heredoc bodies from the command." >&2
+          return 2
+        fi
+        cmd="$raw_cmd"
+      fi
+    elif [ "$mode" = block ]; then
+      echo "BLOCKED: cannot load the heredoc stripper for git gate matching." >&2
+      return 2
+    fi
+  fi
   if [ "$mode" = block ]; then
+    # Alias check uses the same stripped visit text as matching (#1780).
+    # Real alias verbs outside quoted heredocs remain visible.
     git_alias_check "$@" || return 2
     # #1816 G2/G3: an expansion hides the command word or verb.
     if git_uncertain_protected_shape "$cmd"; then
       echo "BLOCKED: a shell expansion hides the git command word or verb. Use a literal git push or git commit." >&2
       return 2
     fi
+  fi
+  # Warm and export the segment cache so prepare subshells reuse it (#1780).
+  if ! _GIT_SEGMENTS_CACHE=$(_git_chain_segments "$cmd"); then
+    if [ "$mode" = block ]; then return 2; fi
+  else
+    _GIT_SEGMENTS_CMD="$cmd"
+    export _GIT_SEGMENTS_CMD _GIT_SEGMENTS_CACHE
   fi
   local prefixes
   for sub in "$@"; do
