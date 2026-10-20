@@ -118,11 +118,22 @@ not decide whether a gate fires on a guess). A negative test keeps a real
    or a receiver inside a substitution, a group, a function body or a
    compound command. It also returns the raw command when the rest of the
    command can reach a body: an expansion, a glob, a pipe, a process
-   substitution, a function or alias definition, a change to `PATH`, or a
-   use of a written file other than as a `--body-file`, `-F`, `--file`,
-   `--input` or `--notes-file` value or an `rm` argument. Any parse doubt
-   (an unclosed quote, an unbalanced paren, a heredoc that this mode does
-   not strip, visible text over 16 KiB) also returns the raw command. A
+   substitution, a function or alias definition, or a change to `PATH`.
+   A `cat` or `tee` file target must be a plain relative or absolute path.
+   No part of it may be `..`, a `.git*` name, `.husky`, `hooks`, `.hooks`
+   or `githooks`, and its resolved directory must exist and must not be
+   inside the git dir or `core.hooksPath`. When a sink writes a file,
+   every other top-level command must be on a short allow-list of commands
+   that do not read a file by an implicit name: `cat`, `tee`, `rm`,
+   `echo`, `printf`, `true`, `false`, `test`, `[`, `:`,
+   `git [-C dir] commit|notes`, `gh pr|issue|release|api` and
+   `glab mr|issue`. Any other command (for example `make`, `npm test` or
+   `bash -i`) returns the raw command. A command that names the written
+   file may use it only as a `--body-file`, `-F`, `--file`, `--input` or
+   `--notes-file` value or an `rm` argument. Any parse doubt (an unclosed
+   quote, an unbalanced paren, an earlier `<<` on the start line before
+   the matched marker, a heredoc that this mode does not strip, visible
+   text over 16 KiB) also returns the raw command. A
    common shape that stays on the raw command is
    `git commit -m "$(cat <<'EOF' ... )"`, because the receiver is inside a
    substitution. That is the base behaviour.
@@ -138,10 +149,13 @@ not decide whether a gate fires on a guess). A negative test keeps a real
   a large body, and a dispatcher timeout blocks (fail closed).
 - A quoted redirection target with a space, or a substitution target, no
   longer hides the verb. A target the grammar cannot match fails closed.
-- Residual: a body that a sink stores (a file, a commit message, a pull
-  request body) and that a later command reads back through an indirect
-  name is the same class as a file written in an earlier Bash call. The
-  text gates did not see that class before this change either.
+- In the same command, a later command can read a written file only if it
+  is on the allow-list above, so `make`, `npm test` or a shell that reads
+  a start-up file keeps the raw command.
+- Residual: a body that a sink stores and that a command in a LATER Bash
+  call reads back (a file, a commit message, a pull request body) is the
+  same class as a file written by the Write tool. The text gates did not
+  see that class before this change either.
 - Dispatcher and visitor alias checks use the stripped route text so quoted
   heredoc prose is not scanned. Real alias verbs outside those bodies still
   block. Merge-shape matching stays on the raw command.

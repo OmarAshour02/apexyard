@@ -597,6 +597,48 @@ EOF_SHQ_SEGMENTS
   return 0
 }
 
+# 0 when every top-level command in flat text $1 is on a short allow-list
+# of commands that do not read a file by an implicit name (#1829 N1). A
+# command such as `make`, `npm test` or `bash -i` reads a written file
+# without naming it, so it returns 1. The allow-list is:
+#   cat, tee, rm, echo, printf, true, false, test, [, :
+#   git [-C dir]... commit|notes ...
+#   gh pr|issue|release|api ...
+#   glab mr|issue ...
+_shq_cmds_ok() {
+  local text="$1" seg first k
+  local -a words
+  text="${text//;/$_shq_nl}"
+  text="${text//&/$_shq_nl}"
+  text="${text//|/$_shq_nl}"
+  while IFS= read -r seg; do
+    words=()
+    read -r -a words <<< "$seg" || :
+    [ "${#words[@]}" -gt 0 ] || continue
+    first="${words[0]}"
+    case "$first" in
+      cat|tee|rm|echo|printf|true|false|test|'['|':') ;;
+      git)
+        k=1
+        while [ "${words[k]-}" = -C ] && [ -n "${words[k+1]-}" ]; do
+          k=$((k + 2))
+        done
+        case "${words[k]-}" in commit|notes) ;; *) return 1 ;; esac
+        ;;
+      gh)
+        case "${words[1]-}" in pr|issue|release|api) ;; *) return 1 ;; esac
+        ;;
+      glab)
+        case "${words[1]-}" in mr|issue) ;; *) return 1 ;; esac
+        ;;
+      *) return 1 ;;
+    esac
+  done <<EOF_SHQ_CMDS
+$text
+EOF_SHQ_CMDS
+  return 0
+}
+
 # 0 when every stripped quoted heredoc feeds an allow-listed data sink and
 # nothing else in the visible text can reach that body. Reads the arrays of
 # strip_heredoc_bodies through dynamic scope. Fails closed (returns 1) on
@@ -646,8 +688,14 @@ _shq_sinks_ok() {
   case "$np" in *'|'*) return 1 ;; esac
   if [[ "$_shq_out" =~ $env_re ]]; then return 1; fi
   if [[ "$_shq_out" =~ \([[:space:]]*\) ]]; then return 1; fi
-  # A file that a sink wrote may be used only as data input (#1805: a
-  # script written and run in the same command keeps the raw command).
+  # When a sink writes a file (#1805, #1829 N1), every top-level command
+  # must be on the _shq_cmds_ok allow-list, so no command reads the file by
+  # an implicit name. A command that names the file may use it only as a
+  # --body-file, -F, --file, --input or --notes-file value or an rm
+  # argument. Otherwise keep the raw command.
+  if [ "${#_SHQ_FILES[@]}" -gt 0 ]; then
+    _shq_cmds_ok "$flat" || return 1
+  fi
   for b in ${_SHQ_FILES[@]+"${_SHQ_FILES[@]}"}; do
     _shq_file_uses_ok "$flat" "$b" || return 1
   done

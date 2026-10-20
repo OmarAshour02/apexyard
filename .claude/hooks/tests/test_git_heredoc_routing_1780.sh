@@ -529,17 +529,30 @@ hid_shapes = [
     ("escaped-commit", f"cat <<\\X; {real_commit}; cat <<{q}EOF{q}\nX\nhello\nEOF", "validate-commit-format.sh"),
     ("husky-target", f"cat > .husky/pre-push <<{q}EOF{q}\n{real_push}\nEOF", "block-main-push.sh"),
     ("githooks-tee", f"tee .githooks/pre-push <<{q}EOF{q}\n{real_push}\nEOF", "block-main-push.sh"),
+    # N1: a later command reads the written file by an implicit name.
+    ("make", f"cat > Makefile <<{q}EOF{q}\nall:\n\t{real_push}\nEOF\nmake", "block-main-push.sh"),
+    ("npm", f"cat > package.json <<{q}EOF{q}\n{{\"scripts\": {{\"test\": \"{real_push}\"}}}}\nEOF\nnpm test", "block-main-push.sh"),
+    ("zshenv", f"cat >> ~/.zshenv <<{q}EOF{q}\n{real_push}\nEOF\nzsh -c true", "block-main-push.sh"),
+    ("tee-make", f"tee Makefile <<{q}EOF{q}\nall:\n\t{real_push}\nEOF\nmake all", "block-main-push.sh"),
+    ("bashrc", f"cat >> ~/.bashrc <<{q}EOF{q}\n{real_push}\nEOF\nbash -i", "block-main-push.sh"),
+    ("githooks-commit", f"cat > .githooks/pre-commit <<{q}EOF{q}\n{real_push}\nEOF\n{real_commit}", "block-main-push.sh"),
+    ("husky-commit", f"cat > .husky/pre-commit <<{q}EOF{q}\n{real_push}\nEOF\n{real_commit}", "block-main-push.sh"),
 ]
 hid_bad = [lb for lb, cmd, gate in hid_shapes if gate not in route_log(cmd, f"hid-{lb}")]
 if hid_bad:
     bad("earlier heredoc / hooks target must route gates: " + ",".join(hid_bad))
 else:
     ok(f"earlier heredoc and hooks targets route gates ({len(hid_shapes)} shapes)")
-hid_allow = f"cat <<{q}A{q} > /tmp/h1829.md\n{prose}\nA"
-if "block-main-push.sh" in route_log(hid_allow, "hid-allow"):
-    bad("allow twin: one quoted sink heredoc with prose must not route push gates")
+hid_allows = [
+    ("one-sink", f"cat <<{q}A{q} > /tmp/h1829.md\n{prose}\nA"),
+    ("body-file-rm", f"cat > /tmp/b1829.md <<{q}EOF{q}\n{prose}\nEOF\n{w_gh} pr comment 1 --body-file /tmp/b1829.md\nrm /tmp/b1829.md"),
+    ("commit-F-rm", f"cat > /tmp/m1829.txt <<{q}EOF{q}\nfix(#1829): note\n\n{prose}\nEOF\ngit {verb_commit} -F /tmp/m1829.txt && rm /tmp/m1829.txt"),
+]
+allow_bad = [lb for lb, cmd in hid_allows if "block-main-push.sh" in route_log(cmd, f"hid-allow-{lb}")]
+if allow_bad:
+    bad("allow twins must not route push gates: " + ",".join(allow_bad))
 else:
-    ok("allow twin: one quoted sink heredoc with prose does not route push gates")
+    ok(f"allow twins do not route push gates ({len(hid_allows)} shapes)")
 
 # Review-body class (#1805, seen after #1804 merged): a quoted heredoc body
 # holds an unresolvable cd and a git verb that is not a builtin (an alias
