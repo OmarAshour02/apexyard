@@ -291,7 +291,7 @@ run_case_F_file
 fail_before_1810() {
   local label="1810 fail-before pinned tip blocks file-write backticks"
   if ! git -C "$SRC_ROOT" cat-file -e "${PINNED_BEFORE_SHA}^{commit}" 2>/dev/null; then
-    echo "SKIP fail-before: pinned commit ${PINNED_BEFORE_SHA} missing"
+    echo "NOTE: skip fail-before: pinned commit ${PINNED_BEFORE_SHA} missing"
     return
   fi
   local scratch before_hook
@@ -300,13 +300,13 @@ fail_before_1810() {
       .claude/hooks/validate-commit-format.sh \
       .claude/hooks/_lib-strip-heredoc.sh \
       2>/dev/null | tar -x -C "$scratch"; then
-    echo "SKIP fail-before: cannot archive hooks from ${PINNED_BEFORE_SHA}"
+    echo "NOTE: skip fail-before: cannot archive hooks from ${PINNED_BEFORE_SHA}"
     rm -rf "$scratch"
     return
   fi
   before_hook="$scratch/.claude/hooks/validate-commit-format.sh"
   if grep -q 'APEXYARD_GIT_ROUTE_CMD\|_SCAN_CMD' "$before_hook" 2>/dev/null; then
-    echo "SKIP fail-before: pinned hook already contains the #1810 scan path"
+    echo "NOTE: skip fail-before: pinned hook already contains the #1810 scan path"
     rm -rf "$scratch"
     return
   fi
