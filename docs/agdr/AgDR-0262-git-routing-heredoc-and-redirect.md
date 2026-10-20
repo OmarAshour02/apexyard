@@ -38,8 +38,9 @@ Stacked on AgDR-0253 / PR #1804.
 
 ## Context
 
-Ticket: me2resh/apexyard#1805 (umbrella). Children: #1772 (redirect routing),
-#1780 (heredoc timeout / false route). Investigation findings: #1777.
+Ticket: me2resh/apexyard#1805 (umbrella). Children: #1772 (redirect
+routing), #1780 (heredoc timeout / false route). The investigation findings
+are in #1777.
 
 AgDR-0113 forbids using `strip_heredoc_bodies` to decide whether a gate
 fires, because an over-strip can fail open. #1780 needs a subtractive route
