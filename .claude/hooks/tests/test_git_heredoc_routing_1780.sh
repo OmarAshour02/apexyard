@@ -412,17 +412,11 @@ sink_pairs = [
     ("cat-append",
      f"cat >> /tmp/r1805.md <<'EOF'\n{prose}\nEOF",
      f"cat >> /tmp/r1805.md <<'EOF'\n{real_push}\nEOF\n. /tmp/r1805.md"),
-    ("cat-noclobber",
-     f"cat >| /tmp/r1805.md <<'EOF'\n{prose}\nEOF",
-     f"cat >| /tmp/r1805.md <<'EOF'\n{real_push}\nEOF\nbash < /tmp/r1805.md"),
-    ("cat-alone",
-     f"cat <<'EOF'\n{prose}\nEOF",
-     f"cat <<'EOF' | bash\n{real_push}\nEOF"),
     ("cat-pipe-tee",
      f"cat <<'EOF' | tee -a /tmp/r1805.md\n{prose}\nEOF",
      f"cat <<'EOF' | tee /tmp/r1805.md | sh\n{real_push}\nEOF"),
-    ("tee-files",
-     f"tee /tmp/a1805.md /tmp/b1805.md <<'EOF' >/dev/null\n{prose}\nEOF",
+    ("tee-file",
+     f"tee /tmp/a1805.md <<'EOF'\n{prose}\nEOF",
      f"tee >(sh) <<'EOF'\n{real_push}\nEOF"),
     ("host-body-file",
      f"{w_gh} pr comment 1 --body-file - <<'EOF'\n{prose}\nEOF",
@@ -430,9 +424,6 @@ sink_pairs = [
     ("host-dash-F",
      f"{w_gh} issue comment 1 -F - <<'EOF'\n{prose}\nEOF",
      f"{w_gh} alias-x 1 -F - <<'EOF'\n{real_push}\nEOF"),
-    ("host-input",
-     f"{w_gh} api repos/o/r/issues/1/comments --input - <<'EOF'\n{prose}\nEOF",
-     f"{w_gh} api repos/o/r/issues/1/comments --input /tmp/x <<'EOF'\n{real_push}\nEOF"),
     ("git-commit-F",
      f"git {verb_commit} -F - <<'EOF'\nfeat(#1805): note\n\n{prose}\nEOF",
      f"git -c core.editor=sh {verb_commit} -e -F - <<'EOF'\n{real_push}\nEOF"),
@@ -543,16 +534,163 @@ if hid_bad:
     bad("earlier heredoc / hooks target must route gates: " + ",".join(hid_bad))
 else:
     ok(f"earlier heredoc and hooks targets route gates ({len(hid_shapes)} shapes)")
+# CEO decision, 2026-10-20: strip only for a single-command data sink.
+# Allow twins: one sink and nothing else in the command.
 hid_allows = [
     ("one-sink", f"cat <<{q}A{q} > /tmp/h1829.md\n{prose}\nA"),
-    ("body-file-rm", f"cat > /tmp/b1829.md <<{q}EOF{q}\n{prose}\nEOF\n{w_gh} pr comment 1 --body-file /tmp/b1829.md\nrm /tmp/b1829.md"),
-    ("commit-F-rm", f"cat > /tmp/m1829.txt <<{q}EOF{q}\nfix(#1829): note\n\n{prose}\nEOF\ngit {verb_commit} -F /tmp/m1829.txt && rm /tmp/m1829.txt"),
+    ("cat-notes", f"cat > notes.md <<{q}EOF{q}\n{prose}\nEOF"),
+    ("gh-comment", f"{w_gh} pr comment 1829 --body-file - <<{q}EOF{q}\n{prose}\nEOF"),
+    ("commit-F", f"git {verb_commit} -F - <<{q}EOF{q}\nfix(#1829): note\n\n{prose}\nEOF"),
 ]
 allow_bad = [lb for lb, cmd in hid_allows if "block-main-push.sh" in route_log(cmd, f"hid-allow-{lb}")]
 if allow_bad:
     bad("allow twins must not route push gates: " + ",".join(allow_bad))
 else:
     ok(f"allow twins do not route push gates ({len(hid_allows)} shapes)")
+
+# #1829 B1b: a line continuation splits an earlier heredoc operator over
+# two lines. Bash removes the backslash-newline, so `<\<newline><1` is
+# `<<1`, and the push or commit after its terminator runs. The stripper
+# must keep the raw command. The allow twins have no continuation in the
+# visible text (a backslash at the end of a body line is data).
+bs = "\\"
+cont_shapes = [
+    ("cont-push", f"cat <{bs}\n<1\ncat <<{q}EOF{q}\n1\n{real_push}\nEOF", "block-main-push.sh"),
+    ("cont-commit", f"cat <{bs}\n<1\ncat <<{q}EOF{q}\n1\n{real_commit}\nEOF", "validate-commit-format.sh"),
+    ("cont-logical-line", f"cat <<1 {bs}\n<<{q}EOF{q}\n{real_push}\n1\nhello\nEOF", "block-main-push.sh"),
+    ("cont-before-sink", f"cat {bs}\n> /tmp/c1829.md <<{q}EOF{q}\n{real_push}\nEOF", "block-main-push.sh"),
+]
+cont_bad = [lb for lb, cmd, gate in cont_shapes if gate not in route_log(cmd, f"b1b-{lb}")]
+if cont_bad:
+    bad("line continuation before a stripped heredoc must route gates: " + ",".join(cont_bad))
+else:
+    ok(f"line continuation before a stripped heredoc routes gates ({len(cont_shapes)} shapes)")
+cont_allows = [
+    ("no-continuation", f"cat <<{q}EOF{q} > /tmp/c1829.md\n{prose}\nEOF"),
+    ("body-backslash", f"cat > /tmp/c1829.md <<{q}EOF{q}\nline one {bs}\n{prose}\nEOF"),
+]
+cont_allow_bad = [lb for lb, cmd in cont_allows if "block-main-push.sh" in route_log(cmd, f"b1b-allow-{lb}")]
+if cont_allow_bad:
+    bad("sinks with no visible continuation must not route push gates: " + ",".join(cont_allow_bad))
+else:
+    ok(f"sinks with no visible continuation do not route push gates ({len(cont_allows)} shapes)")
+
+# #1829 A3: the hooks-path check reads the target's repo and the current
+# repo, expands a leading `~`, and keeps the raw command when a configured
+# hooks path does not resolve. Fixture repos live in tmp. Git config is
+# hermetic: an empty global file and no system file.
+a3 = tmp / "a3"
+a3_home = a3 / "home"
+(a3_home / "hk").mkdir(parents=True)
+a3_gcfg = a3 / "gitconfig"
+a3_gcfg.write_text("")
+a3_env = dict(env, HOME=str(a3_home), GIT_CONFIG_GLOBAL=str(a3_gcfg), GIT_CONFIG_NOSYSTEM="1")
+def a3_repo(name, hooks_path, mkdir_hooks=None):
+    r = a3 / name
+    subprocess.run(["git", "init", "-q", str(r)], check=True, env=a3_env)
+    subprocess.run(["git", "-C", str(r), "config", "core.hooksPath", hooks_path], check=True, env=a3_env)
+    if mkdir_hooks:
+        (r / mkdir_hooks).mkdir(parents=True, exist_ok=True)
+    return r
+def route_log_in(cmd, tag, cwd, extra=None):
+    (tmp / f"{tag}.json").write_text(json.dumps({
+        "tool_name": "Bash",
+        "tool_input": {"command": cmd},
+        "cwd": str(cwd),
+    }))
+    lg = tmp / f"log-{tag}"
+    lg.write_text("")
+    e = dict(a3_env, DISPATCH_LOG=str(lg), **(extra or {}))
+    subprocess.run(
+        ["/bin/bash", str(new_route / "dispatch-bash.sh")],
+        input=(tmp / f"{tag}.json").read_text(),
+        text=True,
+        capture_output=True,
+        cwd=str(cwd),
+        env=e,
+        check=False,
+    )
+    return lg.read_text()
+r_tilde = a3_repo("tilde", "~/hk")
+r_missing = a3_repo("missing", "no-such-hooks")
+r_ok = a3_repo("resolved", "hk-dir", mkdir_hooks="hk-dir")
+hk_target = a3_home / "hk" / "pre-commit"
+a3_blocks = [
+    # The current repo's hooks path is `~/hk`. The target is inside it.
+    ("tilde-cwd", f"cat > {hk_target} <<{q}EOF{q}\n{real_push}\nEOF", r_tilde),
+    # The current repo's hooks path does not resolve.
+    ("missing-cwd", f"cat > /tmp/a1829.md <<{q}EOF{q}\n{prose}\nEOF", r_missing),
+    # The target's repo has a hooks path that does not resolve.
+    ("missing-target", f"cat > {r_missing}/note.md <<{q}EOF{q}\n{prose}\nEOF", r_ok),
+]
+a3_bad = [lb for lb, cmd, cwd in a3_blocks if "block-main-push.sh" not in route_log_in(cmd, f"a3-{lb}", cwd)]
+if a3_bad:
+    bad("hooks path in the target or current repo must keep the raw command: " + ",".join(a3_bad))
+else:
+    ok(f"hooks path in the target or current repo keeps the raw command ({len(a3_blocks)} shapes)")
+a3_allow = route_log_in(f"cat > note.md <<{q}EOF{q}\n{prose}\nEOF", "a3-allow", r_ok)
+if "block-main-push.sh" in a3_allow:
+    bad("resolved hooks path outside the target must not route push gates")
+else:
+    ok("resolved hooks path outside the target does not route push gates")
+
+# Single-command rule (CEO decision, 2026-10-20). Each shape is a sink with
+# something more in the command, or a sink form that is not on the list.
+# The prose body names a push, so the raw command must route the push gates.
+narrow_shapes = [
+    ("body-file-rm", f"cat > /tmp/b1829.md <<{q}EOF{q}\n{prose}\nEOF\n{w_gh} pr comment 1 --body-file /tmp/b1829.md\nrm /tmp/b1829.md"),
+    ("commit-F-rm", f"cat > /tmp/m1829.txt <<{q}EOF{q}\n{prose}\nEOF\ngit {verb_commit} -F /tmp/m1829.txt && rm /tmp/m1829.txt"),
+    ("cd-before", f"cd /tmp && cat > notes.md <<{q}EOF{q}\n{prose}\nEOF"),
+    ("semicolon-after", f"cat > notes.md <<{q}EOF{q}; true\n{prose}\nEOF"),
+    ("assignment-prefix", f"X=1 cat > notes.md <<{q}EOF{q}\n{prose}\nEOF"),
+    ("second-heredoc", f"cat > a.md <<{q}EOF{q}\n{prose}\nEOF\ncat > b.md <<{q}EOF{q}\n{prose}\nEOF"),
+    ("subshell", f"(cat > notes.md <<{q}EOF{q}\n{prose}\nEOF\n)"),
+    ("group", f"{{ cat > notes.md <<{q}EOF{q}\n{prose}\nEOF\n}}"),
+    ("substitution-arg", f"{w_gh} pr create --title \"$(id)\" --body-file - <<{q}EOF{q}\n{prose}\nEOF"),
+    ("cat-alone", f"cat <<{q}EOF{q}\n{prose}\nEOF"),
+    ("cat-noclobber", f"cat >| notes.md <<{q}EOF{q}\n{prose}\nEOF"),
+    ("tee-two-files", f"tee a.md b.md <<{q}EOF{q}\n{prose}\nEOF"),
+    ("tee-devnull", f"tee a.md <<{q}EOF{q} >/dev/null\n{prose}\nEOF"),
+    ("gh-api-input", f"{w_gh} api repos/o/r/issues/1/comments --input - <<{q}EOF{q}\n{prose}\nEOF"),
+    ("gh-editor", f"{w_gh} pr comment 1 --editor --body-file - <<{q}EOF{q}\n{prose}\nEOF"),
+    ("git-dash-C", f"git -C /tmp {verb_commit} -F - <<{q}EOF{q}\n{prose}\nEOF"),
+    ("git-dash-c", f"git -c core.editor=true {verb_commit} -F - <<{q}EOF{q}\n{prose}\nEOF"),
+    ("git-edit", f"git {verb_commit} -e -F - <<{q}EOF{q}\n{prose}\nEOF"),
+    ("symlink-target", f"cat > link1829.md <<{q}EOF{q}\n{prose}\nEOF"),
+]
+(tmp / "link1829.md").symlink_to(tmp / "elsewhere.md")
+narrow_bad = [lb for lb, cmd in narrow_shapes if "block-main-push.sh" not in route_log(cmd, f"narrow-{lb}")]
+if narrow_bad:
+    bad("a sink with more in the command must keep the raw command: " + ",".join(narrow_bad))
+else:
+    ok(f"a sink with more in the command keeps the raw command ({len(narrow_shapes)} shapes)")
+
+# #1829 N2: a single sink that writes a config file that git or gh reads by
+# an implicit name keeps the raw command: a home-directory dot file or dot
+# directory (this includes $HOME/.config) or $XDG_CONFIG_HOME.
+(a3_home / ".config" / "git").mkdir(parents=True)
+(a3_home / ".config" / "gh").mkdir(parents=True)
+a3_xdg = a3 / "xdg"
+(a3_xdg / "gh").mkdir(parents=True)
+w_editor = "edi" + "tor"
+n2_shapes = [
+    ("git-config", f"cat > {a3_home}/.config/git/config <<{q}EOF{q}\n[core]\n\t{w_editor} = {real_push}\nEOF", {}),
+    ("gh-config", f"cat > {a3_home}/.config/gh/config.yml <<{q}EOF{q}\nbrowser: sh -c '{real_push}'\nEOF", {}),
+    ("gitconfig", f"cat >> {a3_home}/.gitconfig <<{q}EOF{q}\n[core]\n\t{w_editor} = {real_push}\nEOF", {}),
+    ("bashrc", f"tee -a {a3_home}/.bashrc <<{q}EOF{q}\n{real_push}\nEOF", {}),
+    ("xdg-gh", f"cat > {a3_xdg}/gh/config.yml <<{q}EOF{q}\nbrowser: sh -c '{real_push}'\nEOF", {"XDG_CONFIG_HOME": str(a3_xdg)}),
+    ("config-then-commit", f"cat > {a3_home}/.config/git/config <<{q}EOF{q}\n[core]\n\t{w_editor} = {real_push}\nEOF\ngit {verb_commit}", {}),
+]
+n2_bad = [lb for lb, cmd, ex in n2_shapes if "block-main-push.sh" not in route_log_in(cmd, f"n2-{lb}", r_ok, ex)]
+if n2_bad:
+    bad("a sink that writes a home config file must keep the raw command: " + ",".join(n2_bad))
+else:
+    ok(f"a sink that writes a home config file keeps the raw command ({len(n2_shapes)} shapes)")
+n2_allow = route_log_in(f"cat > {a3_home}/notes.md <<{q}EOF{q}\n{prose}\nEOF", "n2-allow", r_ok)
+if "block-main-push.sh" in n2_allow:
+    bad("a plain file in the home directory must not route push gates")
+else:
+    ok("a plain file in the home directory does not route push gates")
 
 # Review-body class (#1805, seen after #1804 merged): a quoted heredoc body
 # holds an unresolvable cd and a git verb that is not a builtin (an alias

@@ -5,11 +5,11 @@
 > (2) quoted-heredoc prose that named those verbs and timed out the visitor, I
 > decided to skip redirections (with a full shell-word target) in the shared
 > grammar, strip a confirmed quoted heredoc body before push and commit
-> routing only when an allow-listed data sink receives it, visit each real
+> routing only when the whole command is one allow-listed data sink, visit each real
 > invocation once on that stripped text, and replace the per-character chain
 > segmenter with one awk pass plus a length cap, to keep the gates correct
 > and inside a 3 s budget, accepting that unquoted heredocs, here-strings and
-> every other heredoc receiver still route on the raw command and that a
+> every other command shape still route on the raw command and that a
 > strip load failure fails closed by running both gate groups.
 
 ## Status
@@ -48,6 +48,14 @@ Stacked on AgDR-0253 / PR #1804.
   no whitespace stopped at a quoted target with a space or at a
   substitution target. The verb stayed hidden. The target unit is now one
   full shell word, and an unmatched target fails closed (Decision 1).
+- 2026-10-20 (CEO decision: narrow to single-command sinks after 5 review
+  rounds on PR #1829): rounds 2 to 4 found more ways for other text in the
+  same command to reach or hide around a stripped body (an earlier heredoc
+  with an unmatched delimiter, a line continuation that splits `<<`, a
+  file that a later command reads by an implicit name, a git or gh config
+  file, a hooks path in another repo). The CEO chose to strip only when
+  the whole command is one data sink (Decision 5). The multi-command
+  allow-list and the written-file checks are removed.
 
 ## Context
 
@@ -59,7 +67,8 @@ AgDR-0113 forbids using `strip_heredoc_bodies` to decide whether a gate
 fires, because an over-strip can fail open. #1780 needs a subtractive route
 filter for quoted heredoc **data**. The control is fail-closed: if the
 stripper cannot load or returns non-zero, the dispatcher runs both push and
-commit gate groups. A body is data only when a known data sink receives it.
+commit gate groups. A body is data only when a known data sink receives it
+and the command holds nothing else.
 The allow-list makes that a positive check, so a receiver that the filter
 does not know keeps the raw command (AgDR-0113: a subtractive filter must
 not decide whether a gate fires on a guess). A negative test keeps a real
@@ -88,8 +97,9 @@ not decide whether a gate fires on a guess). A negative test keeps a real
    push or commit word follows, `git_uncertain_protected_shape` returns
    true. The dispatcher then runs both gate groups, and the gates block.
    The no-jq path blocks the same shape.
-2. **#1780** — After continuation join, call
-   `strip_heredoc_bodies "$_scan_cmd" quoted`. Export `APEXYARD_GIT_ROUTE_CMD`
+2. **#1780** — Call `strip_heredoc_bodies "$COMMAND" quoted` on the raw
+   command, then join continuations on its output (#1829 B1b: the stripper
+   must see each backslash-newline). Export `APEXYARD_GIT_ROUTE_CMD`
    for gate visitors. Run the dispatcher alias check on that stripped text
    so quoted heredoc prose is not scanned. Keep `COMMAND` raw for
    merge-shape matching. Gate-level `git_alias_check` in
@@ -99,44 +109,47 @@ not decide whether a gate fires on a guess). A negative test keeps a real
 4. **Linear segments** — `_git_chain_segments` uses `_run_awk_or_fallback` with
    the former Bash loop as fallback. Cap default 65536 bytes; above that,
    print a clear BLOCKED message and return 2.
-5. **Data-sink allow-list (CEO decision, 2026-10-20)** — In `quoted` mode,
-   `strip_heredoc_bodies` keeps the stripped text only when every stripped
-   body feeds an allow-listed data sink. Otherwise it returns the raw
-   command unchanged. The classes are:
-   - `cat` with no arguments: its output goes to the terminal, to a file
-     (`>`, `>>`, `>|`), or through one pipe into `tee`.
-   - `tee` with optional `-a` and file words.
-   - git or a host CLI that reads the body from stdin as data: `git commit`
-     or `git notes` with `-F -`, and `gh pr|issue|release|api` or
-     `glab mr|issue` with a stdin body option (`--body-file -`, `-F -`,
-     `--input -`, `--notes-file -`, `--description -`). Options that open an
-     editor or set config (`-e`, `--editor`, `-c`, `-t`) are not allowed.
-   The receiver must be a plain top-level command. The function returns the
-   raw command for any other receiver: a shell, an interpreter, `eval`,
-   `source`, `.`, a wrapper (`env`, `exec`, `xargs`, `command`), a function,
-   an expansion, a quote- or backslash-mangled word, an assignment prefix,
-   or a receiver inside a substitution, a group, a function body or a
-   compound command. It also returns the raw command when the rest of the
-   command can reach a body: an expansion, a glob, a pipe, a process
-   substitution, a function or alias definition, or a change to `PATH`.
-   A `cat` or `tee` file target must be a plain relative or absolute path.
-   No part of it may be `..`, a `.git*` name, `.husky`, `hooks`, `.hooks`
-   or `githooks`, and its resolved directory must exist and must not be
-   inside the git dir or `core.hooksPath`. When a sink writes a file,
-   every other top-level command must be on a short allow-list of commands
-   that do not read a file by an implicit name: `cat`, `tee`, `rm`,
-   `echo`, `printf`, `true`, `false`, `test`, `[`, `:`,
-   `git [-C dir] commit|notes`, `gh pr|issue|release|api` and
-   `glab mr|issue`. Any other command (for example `make`, `npm test` or
-   `bash -i`) returns the raw command. A command that names the written
-   file may use it only as a `--body-file`, `-F`, `--file`, `--input` or
-   `--notes-file` value or an `rm` argument. Any parse doubt (an unclosed
-   quote, an unbalanced paren, an earlier `<<` on the start line before
-   the matched marker, a heredoc that this mode does not strip, visible
-   text over 16 KiB) also returns the raw command. A
-   common shape that stays on the raw command is
-   `git commit -m "$(cat <<'EOF' ... )"`, because the receiver is inside a
-   substitution. That is the base behaviour.
+5. **Single-command data sinks (CEO decision, 2026-10-20: narrow to
+   single-command sinks after 5 review rounds)** — In `quoted` mode,
+   `strip_heredoc_bodies` keeps the stripped text only when the whole Bash
+   command, without that one heredoc body, is exactly ONE simple command
+   that is a data sink, with nothing before or after it. Otherwise it
+   returns the raw command unchanged. The sinks are:
+   - `cat > file` or `cat >> file`. The heredoc operator can come before
+     or after the redirection (`cat <<'X' > file`).
+   - `cat <<'X' | tee [-a] file`. This is the only pipe that is allowed.
+   - `tee [-a] file`.
+   - `git commit ... -F -` or `--file=-`.
+   - `git notes add|append ... -F -` or `--file=-`.
+   - `gh pr|issue|release create|comment|edit ... --body-file -` or `-F -`.
+   Each sink has one file target. The target must be a plain relative or
+   absolute path with no quotes. No part of it may be `..`, a `.git*` name,
+   `.husky`, `hooks`, `.hooks` or `githooks`. The file must not be a
+   symbolic link. Its resolved directory must exist and must not be inside
+   the git dir, `$XDG_CONFIG_HOME`, or a home-directory dot file or dot
+   directory (this includes `$HOME/.config`). The hooks-path check reads
+   `core.hooksPath` (with `~` expanded) in the target's repo and in the
+   current repo. When a hooks path is set and does not resolve to a
+   directory, or the target is inside it, the function returns the raw
+   command.
+   The function returns the raw command for all other text: `;`, `&&`,
+   `||`, `&`, a pipe other than the `tee` form, a second heredoc or a
+   here-string, any other visible line, a line continuation anywhere in the
+   visible text, a subshell, a group, a substitution or any `$` expansion,
+   a backslash, a glob, an assignment prefix, a quoted command word, `cd`,
+   a redirection other than the one target, the git options `-c`, `-C`,
+   `-e`, `--edit`, `--editor`, `-t` and `--template`, and the gh options
+   `-e`, `--editor`, `-w` and `--web`. Any parse doubt (an unclosed quote,
+   an earlier `<<` on the start line or on the logical line that
+   continuations join, visible text over 4 KiB) also returns the raw
+   command. The dispatcher strips the raw command and then joins
+   continuations, because bash removes a backslash-newline before it reads
+   operators: `<\<newline><` is one `<<` (#1829 B1b).
+   Shapes that stay on the raw command, as on the base, include
+   `git commit -m "$(cat <<'EOF' ... )"` (the receiver is inside a
+   substitution), a multi-line `gh` command with continuations before the
+   body, a sink after `cd`, and a body file that a later command in the
+   same Bash call reads.
 
 ## Consequences
 
@@ -144,18 +157,17 @@ not decide whether a gate fires on a guess). A negative test keeps a real
   less (UTF-8 and `LC_ALL=C`) and does not route those gates.
 - A real push after `cd` and a quoted heredoc still reaches every push gate.
 - Unquoted heredocs and here-strings still route when they name the verbs.
-- A quoted body that any receiver other than an allow-listed data sink gets
+- A quoted body in any command other than a single allow-listed data sink
   still routes, because the raw command is kept. That scan can be slow for
   a large body, and a dispatcher timeout blocks (fail closed).
 - A quoted redirection target with a space, or a substitution target, no
   longer hides the verb. A target the grammar cannot match fails closed.
-- In the same command, a later command can read a written file only if it
-  is on the allow-list above, so `make`, `npm test` or a shell that reads
-  a start-up file keeps the raw command.
-- Residual: a body that a sink stores and that a command in a LATER Bash
-  call reads back (a file, a commit message, a pull request body) is the
-  same class as a file written by the Write tool. The text gates did not
-  see that class before this change either.
+- No other command runs in the same Bash call as a stripped body, so no
+  command in that call can read a file that the sink wrote.
+- Residual: a later Bash call can use a file, a commit message or a pull
+  request body that a sink wrote. This is out of scope. It is the same
+  class as a file written by the Write tool, which the text gates did not
+  see before this change either.
 - Dispatcher and visitor alias checks use the stripped route text so quoted
   heredoc prose is not scanned. Real alias verbs outside those bodies still
   block. Merge-shape matching stays on the raw command.

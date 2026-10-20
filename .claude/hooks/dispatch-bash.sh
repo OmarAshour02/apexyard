@@ -495,14 +495,15 @@ esac
 #
 # The scan adds routing when its join succeeds. If awk fails, run the push
 # and commit gates unconditionally. #1780 / AgDR-0262: strip a confirmed
-# quoted heredoc body before push/commit routing only when its receiver is
-# an allow-listed data sink, so prose mentions do not start those gates.
-# Any other receiver keeps the raw command. The alias check and push/commit
-# routing read the stripped text. The merge-shape scan reads the raw
-# command. If the strip fails, run both gate groups (fail closed).
+# quoted heredoc body before push/commit routing only when the whole
+# command is one allow-listed data sink, so prose mentions do not start
+# those gates. Any other command keeps the raw command. The alias check
+# and push/commit routing read the stripped text. The merge-shape scan
+# reads the raw command. If the strip fails, run both gate groups (fail
+# closed).
 # Unquoted heredocs and here-strings are not stripped here.
 #
-# Line continuations are joined first, because grep reads one line at a
+# Line continuations are joined, because grep reads one line at a
 # time and `git \<newline> push` would otherwise put git and push on
 # different lines. Bash 3.2's whole-string substitution is superlinear on
 # thousands of continuations, so use one awk pass. The sentinel preserves
@@ -514,6 +515,9 @@ _scan_failed=0
 # Preserve broad routing for git\<newline>push and quoted/commented pairs.
 # Bash removal could hide verbs that the existing dispatcher routes.
 _dispatch_join_failure() { return 1; }
+# A join failure here fails closed before the alias library loads. The
+# route text is joined again after the quoted-heredoc strip below
+# (#1829 B1b).
 if [ -r "$HOOK_DIR/_lib-awk-fallback.sh" ]; then
   . "$HOOK_DIR/_lib-awk-fallback.sh"
   if _scan_cmd=$(join_shell_continuations "$COMMAND" broad-space _dispatch_join_failure); then
@@ -555,7 +559,13 @@ if [ "$_scan_failed" -eq 0 ]; then
     . "$HOOK_DIR/_lib-strip-heredoc.sh"
     if ! declare -F strip_heredoc_bodies >/dev/null 2>&1; then
       _scan_failed=1
-    elif ! _scan_cmd=$(strip_heredoc_bodies "$_scan_cmd" quoted); then
+    # #1829 B1b: strip the raw command, then join continuations. The
+    # stripper must see each backslash-newline, because bash removes it
+    # before it reads operators: `<\<newline><` is one `<<`. The joined
+    # text hides that operator.
+    elif ! _scan_cmd=$(strip_heredoc_bodies "$COMMAND" quoted); then
+      _scan_failed=1
+    elif ! _scan_cmd=$(join_shell_continuations "$_scan_cmd" broad-space _dispatch_join_failure); then
       _scan_failed=1
     else
       # Share one stripped route text with the push/commit gates (#1780).

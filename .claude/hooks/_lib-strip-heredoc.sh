@@ -58,9 +58,10 @@
 #
 # ONE EXCEPTION (AgDR-0262, #1780 / #1805): the dispatcher and
 # git_visit_invocations use `quoted` mode for push and commit routing. That
-# mode strips a body only when the command that receives it is on a short
-# allow-list of data sinks (see _shq_sinks_ok). Any other receiver, and any
-# parse doubt, returns the raw command, so the gates see the body.
+# mode strips a body only when the whole command is exactly one simple
+# command that is an allow-listed data sink (see _shq_sinks_ok). Anything
+# else, and any parse doubt, returns the raw command, so the gates see the
+# body.
 #
 # Strips heredoc BODY text (and the heredoc's own start/terminator lines)
 # from a command string, but ONLY for heredocs that are CONFIRMED — both:
@@ -105,99 +106,86 @@
 #   quoted  — strip only heredocs whose delimiter is quoted (`<<'EOF'` /
 #             `<<"EOF"`). Used by the dispatcher for push/commit routing
 #             (#1780 / AgDR-0262). Unquoted heredocs and here-strings keep
-#             today's checks. A body is stripped only when its receiver is
-#             an allow-listed data sink (_shq_sinks_ok). Otherwise the raw
-#             command is returned unchanged.
+#             today's checks. A body is stripped only when the whole
+#             command is one allow-listed data sink with nothing before or
+#             after it (_shq_sinks_ok). Otherwise the raw command is
+#             returned unchanged.
 
-# --- quoted mode: data-sink allow-list (#1805, AgDR-0262) -----------------
-# CEO decision 2026-10-20: strip a quoted body only when the command that
-# receives it is a known data sink. These helpers share state through
-# dynamic scope with _shq_sinks_ok. Each one returns 1 on any doubt.
+# --- quoted mode: single-command data sinks (#1805, AgDR-0262) ------------
+# CEO decision, 2026-10-20: narrow to single-command sinks after 5 review
+# rounds. Strip a quoted body only when the whole Bash command, without
+# that body, is exactly ONE simple command that is a data sink, with
+# nothing before or after it. These helpers share state through dynamic
+# scope with _shq_sinks_ok. Each one returns 1 on any doubt.
 
-# Split $1 into words in _SHQ_T. Words keep their quotes. A separator
-# (`|`, `;`, `&`, or a doubled one) is its own word. A comment ends the
-# text. Return 1 on an open quote, a substitution, a backquote or a paren.
-_shq_split() {
-  local s="$1" i=0 n c nc w="" inw=0 q=""
-  _SHQ_T=()
+# Split $1 into words in _SHQ_W, with a flag per word in _SHQ_Q: 0 for a
+# plain word, 1 for a word with quotes (removed), 2 for an operator (`>`,
+# `>>`, `|`). A `#` at the start of a word ends the text. Return 1 on an
+# open quote, on `$`, a backquote or a backslash in double quotes, and on
+# any character outside quotes that is not on a short safe list. That list
+# leaves out `\ $ ` ( ) { } ; & < * ? [ ~` and all control characters.
+_shq_words() {
+  local s="$1" i=0 n c w="" inw=0 q=0
+  _SHQ_W=()
+  _SHQ_Q=()
   n=${#s}
+  [ "$n" -le 4096 ] || return 1
   while [ "$i" -lt "$n" ]; do
     c="${s:i:1}"
-    nc="${s:i+1:1}"
-    if [ -n "$q" ]; then
-      w+="$c"
-      if [ "$q" = '"' ]; then
-        case "$c" in
-          \\) w+="$nc"; i=$((i + 2)); continue ;;
-          '`') return 1 ;;
-          '$') [ "$nc" != '(' ] || return 1 ;;
-        esac
-      fi
-      [ "$c" != "$q" ] || q=""
-      i=$((i + 1))
-      continue
-    fi
     case "$c" in
-      ' '|"$_shq_tab"|"$_shq_nl")
-        if [ "$inw" -eq 1 ]; then _SHQ_T+=("$w"); w=""; inw=0; fi
+      ' '|"$_shq_tab")
+        if [ "$inw" -eq 1 ]; then
+          _SHQ_W+=("$w"); _SHQ_Q+=("$q"); w=""; inw=0; q=0
+        fi
         ;;
-      \'|\") q="$c"; w+="$c"; inw=1 ;;
-      \\) w+="$c$nc"; inw=1; i=$((i + 2)); continue ;;
-      '`'|'('|')') return 1 ;;
-      '$') [ "$nc" != '(' ] || return 1; w+="$c"; inw=1 ;;
+      \')
+        inw=1; q=1; i=$((i + 1))
+        while [ "$i" -lt "$n" ] && [ "${s:i:1}" != \' ]; do
+          w+="${s:i:1}"; i=$((i + 1))
+        done
+        [ "$i" -lt "$n" ] || return 1
+        ;;
+      \")
+        inw=1; q=1; i=$((i + 1))
+        while [ "$i" -lt "$n" ] && [ "${s:i:1}" != \" ]; do
+          case "${s:i:1}" in '$'|'`'|\\) return 1 ;; esac
+          w+="${s:i:1}"; i=$((i + 1))
+        done
+        [ "$i" -lt "$n" ] || return 1
+        ;;
+      '>'|'|')
+        if [ "$inw" -eq 1 ]; then
+          _SHQ_W+=("$w"); _SHQ_Q+=("$q"); w=""; inw=0; q=0
+        fi
+        if [ "$c" = '>' ] && [ "${s:i+1:1}" = '>' ]; then
+          c='>>'; i=$((i + 1))
+        fi
+        _SHQ_W+=("$c"); _SHQ_Q+=(2)
+        ;;
       '#')
         [ "$inw" -eq 1 ] || break
         w+="$c"
         ;;
-      ';'|'&'|'|')
-        # `2>&1` and `>|` belong to the redirection word.
-        case "$w" in
-          *'>'|*'<')
-            if [ "$c" != ';' ]; then w+="$c"; i=$((i + 1)); continue; fi
-            ;;
-        esac
-        if [ "$inw" -eq 1 ]; then _SHQ_T+=("$w"); w=""; inw=0; fi
-        if [ "$nc" = "$c" ]; then
-          _SHQ_T+=("$c$c")
-          i=$((i + 2))
-          continue
-        fi
-        _SHQ_T+=("$c")
-        ;;
-      *) w+="$c"; inw=1 ;;
+      [A-Za-z0-9._/=:@%+,^!-]) w+="$c"; inw=1 ;;
+      *) return 1 ;;
     esac
     i=$((i + 1))
   done
-  [ -z "$q" ] || return 1
-  if [ "$inw" -eq 1 ]; then _SHQ_T+=("$w"); fi
+  if [ "$inw" -eq 1 ]; then
+    _SHQ_W+=("$w"); _SHQ_Q+=("$q")
+  fi
   return 0
 }
 
-# 0 when $1 starts with an output or input redirection operator. Sets
-# _SHQ_RFD (fd digits), _SHQ_ROP (operator) and _SHQ_RTGT (glued target).
-_shq_redir() {
-  local re='^([0-9]*)(&>>|&>|>>|>[|]|>&|>|<<<|<&|<)(.*)$'
-  [[ "$1" =~ $re ]] || return 1
-  _SHQ_RFD="${BASH_REMATCH[1]}"
-  _SHQ_ROP="${BASH_REMATCH[2]}"
-  _SHQ_RTGT="${BASH_REMATCH[3]}"
-  return 0
-}
-
-# Check one file target word and record its base name in _SHQ_FILES.
-# /dev/null, /dev/stdout and /dev/stderr are not files. This is an
-# allow-list (#1829 A1): the target must be a plain relative or absolute
-# path. No part of it may name a git dir or a hooks dir, and its resolved
-# directory must not be inside a git dir or the configured hooks path.
-# Any doubt returns 1.
+# Check one file target word. This is an allow-list (#1829 A1, N2): the
+# target must be a plain relative or absolute path. No part of it may name
+# a git dir or a hooks dir. The file must not be a symbolic link. Its
+# resolved directory must exist and must not be inside a git dir, a
+# configured hooks path, $XDG_CONFIG_HOME, or a home-directory dot file or
+# dot directory (this includes $HOME/.config). Any doubt returns 1.
 _shq_target() {
-  local t="$1" b d lc part rd gd hp
-  case "$t" in ''|*\\*) return 1 ;; esac
-  t="${t//\"/}"
-  t="${t//\'/}"
-  case "$t" in
-    /dev/null|/dev/stdout|/dev/stderr) return 0 ;;
-  esac
+  local t="$1" b d lc part rd gd hr xr
+  case "$t" in /dev/null|/dev/stdout|/dev/stderr) return 1 ;; esac
   [[ "$t" =~ ^[A-Za-z0-9._+%@,=/-]+$ ]] || return 1
   case "$t" in -*|*/) return 1 ;; esac
   lc="$(printf '%s' "$t" | tr '[:upper:]' '[:lower:]')"
@@ -215,491 +203,162 @@ _shq_target() {
   case "$t" in */*) d="${t%/*}"; [ -n "$d" ] || d=/ ;; esac
   rd="$(cd -P -- "$d" 2>/dev/null && pwd -P)" || return 1
   [ -n "$rd" ] || return 1
+  [ ! -L "$rd/$b" ] || return 1
+  # Home-directory dot files and dot directories hold config that other
+  # programs read by an implicit name (#1829 N2).
+  [ -n "${HOME:-}" ] || return 1
+  hr="$(cd -P -- "$HOME" 2>/dev/null && pwd -P)" || return 1
+  [ -n "$hr" ] || return 1
+  case "$rd/$b" in "$hr"/.*) return 1 ;; esac
+  if [ -n "${XDG_CONFIG_HOME:-}" ]; then
+    xr="$(cd -P -- "$XDG_CONFIG_HOME" 2>/dev/null && pwd -P)" || xr="$XDG_CONFIG_HOME"
+    case "$rd/" in "${xr%/}"/*) return 1 ;; esac
+  fi
   if gd="$(git -C "$rd" rev-parse --absolute-git-dir 2>/dev/null)" && [ -n "$gd" ]; then
     gd="$(cd -P -- "$gd" 2>/dev/null && pwd -P)" || return 1
     case "$rd/" in "$gd"/*) return 1 ;; esac
-    hp="$(git -C "$rd" config --get core.hooksPath 2>/dev/null)" || hp=""
-    if [ -n "$hp" ]; then
-      case "$hp" in
-        /*) ;;
-        *) hp="$(git -C "$rd" rev-parse --show-toplevel 2>/dev/null)/$hp" ;;
-      esac
-      if [ -d "$hp" ]; then
-        hp="$(cd -P -- "$hp" 2>/dev/null && pwd -P)" || return 1
-        case "$rd/" in "$hp"/*) return 1 ;; esac
-      fi
-    fi
   fi
-  _SHQ_FILES+=("$b")
+  # #1829 A3: check the hooks path of the target's repo and of the current
+  # repo.
+  _shq_hooks_ok "$rd" "$rd" || return 1
+  _shq_hooks_ok "$rd" . || return 1
   return 0
 }
 
-# Consume the redirection word at _SHQ_T[_SHQ_J] and its target.
-# $1 = 1: stdout may go to a file. $1 = 0: only /dev/null or an fd copy.
-_shq_take_redir() {
-  local tok="${_SHQ_T[_SHQ_J]-}" tgt
-  _shq_redir "$tok" || return 1
-  case "$_SHQ_ROP" in '>'|'>>'|'>|'|'>&') ;; *) return 1 ;; esac
-  tgt="$_SHQ_RTGT"
-  if [ -z "$tgt" ]; then
-    _SHQ_J=$((_SHQ_J + 1))
-    tgt="${_SHQ_T[_SHQ_J]-}"
-    [ -n "$tgt" ] || return 1
-    if _shq_redir "$tgt"; then return 1; fi
-    case "$tgt" in '|'|'||'|';'|';;'|'&'|'&&') return 1 ;; esac
-  fi
-  _SHQ_J=$((_SHQ_J + 1))
-  if [ "$_SHQ_ROP" = '>&' ]; then
-    case "${_SHQ_RFD:-1}:$tgt" in
-      1:2|2:1) [ "${_SHQ_RFD:-1}" != 1 ] || _SHQ_OUT=1; return 0 ;;
-    esac
-    return 1
-  fi
-  case "${_SHQ_RFD:-1}" in
-    1)
-      _SHQ_OUT=1
-      [ "$tgt" != /dev/null ] || return 0
-      [ "$1" = 1 ] || return 1
-      _shq_target "$tgt"
-      return
+# 0 when the core.hooksPath that git reads in repo dir $2 is unset, or
+# resolves to a directory that does not hold resolved directory $1. A
+# hooks path that is set but does not resolve returns 1 (fail closed).
+# `--type=path` expands a leading `~`. A relative path is relative to the
+# top of the work tree.
+_shq_hooks_ok() {
+  local rd="$1" r="$2" hp rc=0 top
+  hp="$(git -C "$r" config --type=path --get core.hooksPath 2>/dev/null)" || rc=$?
+  [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ] || return 1
+  [ -n "$hp" ] || return 0
+  case "$hp" in
+    /*) ;;
+    *)
+      top="$(git -C "$r" rev-parse --show-toplevel 2>/dev/null)" || return 1
+      [ -n "$top" ] || return 1
+      hp="$top/$hp"
       ;;
-    2) [ "$tgt" = /dev/null ]; return ;;
   esac
-  return 1
-}
-
-# tee arguments from _SHQ_J: -a, file words, and redirections.
-_shq_tee_args() {
-  local n=${#_SHQ_T[@]} tok
-  while [ "$_SHQ_J" -lt "$n" ]; do
-    tok="${_SHQ_T[_SHQ_J]}"
-    case "$tok" in
-      -a|--append) _SHQ_J=$((_SHQ_J + 1)); continue ;;
-    esac
-    if _shq_redir "$tok"; then
-      _shq_take_redir 1 || return 1
-      continue
-    fi
-    case "$tok" in -*|'|'|'||'|';'|';;'|'&'|'&&') return 1 ;; esac
-    _shq_target "$tok" || return 1
-    _SHQ_J=$((_SHQ_J + 1))
-  done
+  [ -d "$hp" ] || return 1
+  hp="$(cd -P -- "$hp" 2>/dev/null && pwd -P)" || return 1
+  [ -n "$hp" ] || return 1
+  case "$rd/" in "$hp"/*) return 1 ;; esac
   return 0
 }
 
-# Arguments of git or a host CLI from _SHQ_J. One option in $1 must take
-# `-` (stdin) as its value. $2 lists options that open an editor or change
-# config, which this receiver must not have.
-_shq_cli_args() {
-  local opts="$1" deny="$2" n=${#_SHQ_T[@]} tok prev="" o stdin=0
-  while [ "$_SHQ_J" -lt "$n" ]; do
-    tok="${_SHQ_T[_SHQ_J]}"
-    case "$tok" in '|'|'||'|';'|';;'|'&'|'&&') return 1 ;; esac
-    for o in $deny; do
-      case "$tok" in "$o"|"$o"=*) return 1 ;; esac
-    done
-    if _shq_redir "$tok"; then
-      _shq_take_redir 0 || return 1
-      prev=""
-      continue
-    fi
-    case "$tok" in *'<'*|*'>'*) return 1 ;; esac
+# Arguments of git or gh in _SHQ_W from index $1. Every word must be a word,
+# not an operator. $2 lists the option letters that a single-dash cluster
+# must not hold. $3 lists long options that must not appear (alone or with
+# `=value`). $4 lists the options that take `-` (stdin) as the body value;
+# one of them must do so.
+_shq_cli_ok() {
+  local k="$1" letters="$2" deny="$3" opts="$4" n=${#_SHQ_W[@]} tok prev="" o stdin=0
+  while [ "$k" -lt "$n" ]; do
+    [ "${_SHQ_Q[k]}" != 2 ] || return 1
+    tok="${_SHQ_W[k]}"
+    case "$tok" in
+      --*)
+        for o in $deny; do
+          case "$tok" in "$o"|"$o"=*) return 1 ;; esac
+        done
+        ;;
+      -?*)
+        case "${tok#-}" in *["$letters"]*) return 1 ;; esac
+        ;;
+    esac
     for o in $opts; do
       if { [ "$prev" = "$o" ] && [ "$tok" = - ]; } || [ "$tok" = "$o=-" ]; then
         stdin=1
       fi
     done
-    case " $opts :$tok" in *' -F '*:-F-) stdin=1 ;; esac
     prev="$tok"
-    _SHQ_J=$((_SHQ_J + 1))
+    k=$((k + 1))
   done
   [ "$stdin" -eq 1 ]
 }
 
-# 0 when the receiver words ($1 before the heredoc operator, $2 after the
-# delimiter) are an allow-listed data sink:
-#   cat [> | >> | >| file] [| tee [-a] file...]
-#   tee [-a] file... [> file]
-#   git [-C dir] commit|notes ... -F - | --file=-
-#   gh pr|issue|release|api ... --body-file - | -F - | --input - | --notes-file -
-#   glab mr|issue ... --description -
-_shq_receiver_ok() {
-  local seg="$1" rest="$2" n
-  # A digit before `<<` feeds another fd, not stdin.
-  case "$seg" in *[0-9]) return 1 ;; esac
-  _shq_split "$seg $rest" || return 1
-  n=${#_SHQ_T[@]}
-  [ "$n" -gt 0 ] || return 1
-  _SHQ_J=1
-  _SHQ_OUT=0
-  case "${_SHQ_T[0]}" in
+# 0 when $1 (the start-line text before the heredoc operator) and $2 (the
+# text after the delimiter) form one allow-listed data sink:
+#   cat > file | cat >> file   (the operator can come before or after)
+#   cat <<'X' | tee [-a] file
+#   tee [-a] file
+#   git commit ... -F - | --file=-
+#   git notes add|append ... -F - | --file=-
+#   gh pr|issue|release create|comment|edit ... --body-file - | -F -
+# git must not have -c, -C, -e, --edit, --editor, -t or --template. gh must
+# not have -e, --editor, -w or --web.
+_shq_single_sink() {
+  local pre="$1" rest="$2" n k
+  case "$pre$rest" in *'<'*) return 1 ;; esac
+  _shq_words "$pre $rest" || return 1
+  n=${#_SHQ_W[@]}
+  [ "$n" -ge 2 ] && [ "${_SHQ_Q[0]}" = 0 ] && [ "${_SHQ_Q[1]}" != 1 ] || return 1
+  case "${_SHQ_W[0]}" in
     cat)
-      while [ "$_SHQ_J" -lt "$n" ]; do
-        if [ "${_SHQ_T[_SHQ_J]}" = '|' ]; then
-          [ "$_SHQ_OUT" -eq 0 ] || return 1
-          [ "${_SHQ_T[_SHQ_J+1]-}" = tee ] || return 1
-          _SHQ_J=$((_SHQ_J + 2))
-          _shq_tee_args
+      case "$n:${_SHQ_W[1]}:${_SHQ_Q[1]}" in
+        '3:>:2'|'3:>>:2')
+          [ "${_SHQ_Q[2]}" = 0 ] || return 1
+          _shq_target "${_SHQ_W[2]}"
           return
-        fi
-        _shq_take_redir 1 || return 1
-      done
-      return 0
+          ;;
+      esac
+      # The pipe form: the heredoc operator comes right after `cat`.
+      [[ "$pre" =~ ^[[:space:]]*cat[[:space:]]*$ ]] || return 1
+      [ "${_SHQ_W[1]}" = '|' ] && [ "${_SHQ_Q[1]}" = 2 ] || return 1
+      [ "${_SHQ_W[2]-}" = tee ] && [ "${_SHQ_Q[2]-}" = 0 ] || return 1
+      k=3
       ;;
-    tee)
-      _shq_tee_args
-      return
-      ;;
+    tee) k=1 ;;
     git)
-      while [ "${_SHQ_T[_SHQ_J]-}" = -C ]; do
-        case "${_SHQ_T[_SHQ_J+1]-}" in ''|-*|'|'*|';'*|'&'*|*'<'*|*'>'*) return 1 ;; esac
-        _SHQ_J=$((_SHQ_J + 2))
-      done
-      case "${_SHQ_T[_SHQ_J]-}" in commit|notes) ;; *) return 1 ;; esac
-      _SHQ_J=$((_SHQ_J + 1))
-      _shq_cli_args '-F --file' '-c -e --edit -t --template'
+      case "${_SHQ_W[1]}" in
+        commit) k=2 ;;
+        notes)
+          case "${_SHQ_W[2]-}:${_SHQ_Q[2]-}" in add:0|append:0) k=3 ;; *) return 1 ;; esac
+          ;;
+        *) return 1 ;;
+      esac
+      _shq_cli_ok "$k" 'ceCt' '--edit --editor --template' '-F --file'
       return
       ;;
     gh)
-      case "${_SHQ_T[1]-}" in pr|issue|release|api) ;; *) return 1 ;; esac
-      _SHQ_J=2
-      _shq_cli_args '--body-file -F --input --notes-file' '-e --editor'
+      case "${_SHQ_W[1]}" in pr|issue|release) ;; *) return 1 ;; esac
+      case "${_SHQ_W[2]-}:${_SHQ_Q[2]-}" in create:0|comment:0|edit:0) ;; *) return 1 ;; esac
+      _shq_cli_ok 3 'ew' '--editor --web' '--body-file -F'
       return
       ;;
-    glab)
-      case "${_SHQ_T[1]-}" in mr|issue) ;; *) return 1 ;; esac
-      _SHQ_J=2
-      _shq_cli_args '--description' '-e --editor'
-      return
-      ;;
+    *) return 1 ;;
   esac
-  return 1
+  # tee [-a] file, alone or after `cat <<'X' |`.
+  case "${_SHQ_W[k]-}:${_SHQ_Q[k]-}" in -a:0|--append:0) k=$((k + 1)) ;; esac
+  [ "$((k + 1))" -eq "$n" ] && [ "${_SHQ_Q[k]}" = 0 ] || return 1
+  _shq_target "${_SHQ_W[k]}"
 }
 
-# End the current word. Track compound commands at a command position.
-_shq_word_end() {
-  local w="$_shq_word"
-  _shq_word=""
-  [ -n "$w" ] || return 0
-  [ "$_shq_cmdstart" -eq 1 ] || return 0
-  case "$w" in
-    if|while|until|for|select|case) _shq_k=$((_shq_k + 1)) ;;
-    fi|done|'esac')
-      _shq_k=$((_shq_k - 1))
-      [ "$_shq_k" -ge 0 ] || return 1
-      _shq_cmdstart=0
-      ;;
-    then|do|else|elif|'!'|time) ;;
-    function|coproc) return 1 ;;
-    [A-Za-z_]*=*) ;;
-    *) _shq_cmdstart=0 ;;
-  esac
-  return 0
-}
-
-# Scan one piece of visible text (text outside the stripped bodies).
-# Track quotes, substitutions, groups and the current top-level command
-# (_shq_seg). Text of finished top-level commands goes to _shq_out.
-# Return 1 on parse doubt: a heredoc this mode does not strip, an
-# unbalanced `)`, or a function keyword.
-_shq_scan() {
-  local s="$1" i=0 n c nc top
-  n=${#s}
-  while [ "$i" -lt "$n" ]; do
-    c="${s:i:1}"
-    nc="${s:i+1:1}"
-    if [ -n "$_shq_sq" ]; then
-      _shq_seg+="$c"
-      if [ "$_shq_sq" = A ] && [ "$c" = \\ ]; then
-        _shq_seg+="$nc"
-        i=$((i + 2))
-        continue
-      fi
-      [ "$c" != "'" ] || _shq_sq=""
-      i=$((i + 1))
-      continue
-    fi
-    top="${_shq_stk: -1}"
-    if [ "$top" = D ] || [ "$top" = E ]; then
-      # Inside "..." or ${...}.
-      _shq_seg+="$c"
-      case "$c" in
-        \\) _shq_seg+="$nc"; i=$((i + 2)); continue ;;
-        \") if [ "$top" = D ]; then _shq_stk="${_shq_stk%?}"; else _shq_stk+=D; fi ;;
-        \') [ "$top" = D ] || _shq_sq=S ;;
-        '}') [ "$top" = D ] || _shq_stk="${_shq_stk%?}" ;;
-        '`') _shq_stk+=B ;;
-        '$')
-          case "$nc" in
-            '(') _shq_stk+=C; _shq_seg+="$nc"; i=$((i + 2)); continue ;;
-            '{') _shq_stk+=E; _shq_seg+="$nc"; i=$((i + 2)); continue ;;
-          esac
-          ;;
-      esac
-      i=$((i + 1))
-      continue
-    fi
-    # Command context: top level, $(...), `...`, (...) or { ...; }.
-    case "$c" in
-      \\)
-        if [ "$nc" = "$_shq_nl" ]; then
-          _shq_word_end || return 1
-          _shq_seg+=" "
-        else
-          _shq_seg+="$c$nc"
-          _shq_word+="$c$nc"
-        fi
-        i=$((i + 2))
-        continue
-        ;;
-      \') _shq_sq=S; _shq_seg+="$c"; _shq_word+="$c" ;;
-      \") _shq_stk+=D; _shq_seg+="$c"; _shq_word+="$c" ;;
-      '`')
-        if [ "$top" = B ]; then _shq_stk="${_shq_stk%?}"; else _shq_stk+=B; fi
-        _shq_seg+="$c"
-        _shq_word+="$c"
-        ;;
-      '$')
-        case "$nc" in
-          '('|'{'|\')
-            case "$nc" in
-              '(') _shq_stk+=C ;;
-              '{') _shq_stk+=E ;;
-              *) _shq_sq=A ;;
-            esac
-            _shq_seg+="$c$nc"
-            _shq_word+="$c$nc"
-            i=$((i + 2))
-            continue
-            ;;
-        esac
-        _shq_seg+="$c"
-        _shq_word+="$c"
-        ;;
-      '(') _shq_stk+=P; _shq_seg+="$c"; _shq_word+="$c" ;;
-      ')')
-        case "$top" in C|P) _shq_stk="${_shq_stk%?}" ;; *) return 1 ;; esac
-        _shq_seg+="$c"
-        _shq_word+="$c"
-        ;;
-      '{')
-        if [ -z "$_shq_word" ] && [ "$_shq_cmdstart" -eq 1 ]; then
-          case "$nc" in
-            ' '|"$_shq_tab"|"$_shq_nl"|'')
-              _shq_stk+=G
-              _shq_seg+="$c"
-              i=$((i + 1))
-              continue
-              ;;
-          esac
-        fi
-        _shq_seg+="$c"
-        _shq_word+="$c"
-        ;;
-      '}')
-        if [ -z "$_shq_word" ] && [ "$top" = G ]; then
-          _shq_stk="${_shq_stk%?}"
-          _shq_cmdstart=0
-        else
-          _shq_word+="$c"
-        fi
-        _shq_seg+="$c"
-        ;;
-      '#')
-        if [ -z "$_shq_word" ]; then
-          while [ "$i" -lt "$n" ] && [ "${s:i:1}" != "$_shq_nl" ]; do
-            i=$((i + 1))
-          done
-          continue
-        fi
-        _shq_seg+="$c"
-        _shq_word+="$c"
-        ;;
-      '<')
-        if [ "$nc" = '<' ]; then
-          # A here-string is a word. Any other `<<` is a heredoc that this
-          # mode did not strip, so its body is not parsed: doubt.
-          [ "${s:i+2:1}" = '<' ] || return 1
-          _shq_seg+='<<<'
-          _shq_word+='<<<'
-          i=$((i + 3))
-          continue
-        fi
-        _shq_seg+="$c"
-        _shq_word+="$c"
-        ;;
-      ';'|'&'|'|'|"$_shq_nl")
-        case "$_shq_word" in
-          *'>'|*'<')
-            if [ "$c" = '&' ] || [ "$c" = '|' ]; then
-              _shq_seg+="$c"
-              _shq_word+="$c"
-              i=$((i + 1))
-              continue
-            fi
-            ;;
-        esac
-        _shq_word_end || return 1
-        if [ -z "$_shq_stk" ]; then
-          _shq_out+="$_shq_seg$c"
-          _shq_seg=""
-        else
-          _shq_seg+="$c"
-        fi
-        _shq_cmdstart=1
-        ;;
-      ' '|"$_shq_tab")
-        _shq_word_end || return 1
-        _shq_seg+="$c"
-        ;;
-      *) _shq_seg+="$c"; _shq_word+="$c" ;;
-    esac
-    i=$((i + 1))
-  done
-  return 0
-}
-
-# 0 when every use of file base name $2 in flat text $1 is a data input:
-# the value of --body-file, -F, --file, --input or --notes-file of gh, git
-# or glab, or an rm argument.
-_shq_file_uses_ok() {
-  local text="$1" b="$2" seg tok prev first val
-  local -a words
-  case "$text" in *"$b"*) ;; *) return 0 ;; esac
-  text="${text//;/$_shq_nl}"
-  text="${text//&/$_shq_nl}"
-  while IFS= read -r seg; do
-    case "$seg" in *"$b"*) ;; *) continue ;; esac
-    read -r -a words <<< "$seg" || :
-    first="${words[0]-}"
-    case "$first" in gh|git|glab|rm) ;; *) return 1 ;; esac
-    [ "$first" != rm ] || continue
-    prev=""
-    for tok in "${words[@]}"; do
-      case "$tok" in
-        *"$b"*)
-          case "$tok" in
-            --body-file=*|--file=*|--input=*|--notes-file=*) val="${tok#*=}" ;;
-            -F?*) val="${tok#-F}" ;;
-            *)
-              case "$prev" in --body-file|-F|--file|--input|--notes-file) ;; *) return 1 ;; esac
-              val="$tok"
-              ;;
-          esac
-          [ "$val" = "$b" ] || [ "${val%/"$b"}" != "$val" ] || return 1
-          ;;
-      esac
-      prev="$tok"
-    done
-  done <<EOF_SHQ_SEGMENTS
-$text
-EOF_SHQ_SEGMENTS
-  return 0
-}
-
-# 0 when every top-level command in flat text $1 is on a short allow-list
-# of commands that do not read a file by an implicit name (#1829 N1). A
-# command such as `make`, `npm test` or `bash -i` reads a written file
-# without naming it, so it returns 1. The allow-list is:
-#   cat, tee, rm, echo, printf, true, false, test, [, :
-#   git [-C dir]... commit|notes ...
-#   gh pr|issue|release|api ...
-#   glab mr|issue ...
-_shq_cmds_ok() {
-  local text="$1" seg first k
-  local -a words
-  text="${text//;/$_shq_nl}"
-  text="${text//&/$_shq_nl}"
-  text="${text//|/$_shq_nl}"
-  while IFS= read -r seg; do
-    words=()
-    read -r -a words <<< "$seg" || :
-    [ "${#words[@]}" -gt 0 ] || continue
-    first="${words[0]}"
-    case "$first" in
-      cat|tee|rm|echo|printf|true|false|test|'['|':') ;;
-      git)
-        k=1
-        while [ "${words[k]-}" = -C ] && [ -n "${words[k+1]-}" ]; do
-          k=$((k + 2))
-        done
-        case "${words[k]-}" in commit|notes) ;; *) return 1 ;; esac
-        ;;
-      gh)
-        case "${words[1]-}" in pr|issue|release|api) ;; *) return 1 ;; esac
-        ;;
-      glab)
-        case "${words[1]-}" in mr|issue) ;; *) return 1 ;; esac
-        ;;
-      *) return 1 ;;
-    esac
-  done <<EOF_SHQ_CMDS
-$text
-EOF_SHQ_CMDS
-  return 0
-}
-
-# 0 when every stripped quoted heredoc feeds an allow-listed data sink and
-# nothing else in the visible text can reach that body. Reads the arrays of
-# strip_heredoc_bodies through dynamic scope. Fails closed (returns 1) on
-# any doubt.
+# 0 when the command is one stripped quoted heredoc that feeds a single
+# allow-listed data sink, and every other visible line is blank. Reads the
+# arrays of strip_heredoc_bodies through dynamic scope. Fails closed
+# (returns 1) on any doubt.
 _shq_sinks_ok() {
   local LC_ALL=C
-  local _shq_nl=$'\n' _shq_tab
+  local _shq_tab start=-1 idx
   _shq_tab="$(printf '\t')"
-  local _shq_out="" _shq_seg="" _shq_stk="" _shq_sq="" _shq_word=""
-  local _shq_cmdstart=1 _shq_k=0 total=0 idx text flat np b
-  local env_re='(^|[^[:alnum:]_])(alias|unalias|function|exec|enable|hash|builtin|command|trap|eval|source|PATH|BASH_ENV)([^[:alnum:]_]|$)'
-  _SHQ_FILES=()
   for ((idx = 0; idx < n; idx++)); do
     [ "${skip[idx]}" -eq 0 ] || continue
     if [ "${is_start[idx]}" -eq 1 ]; then
-      text="${prefix[idx]}"
-    else
-      text="${lines[idx]}$_shq_nl"
+      [ "$start" -lt 0 ] || return 1
+      start=$idx
+      continue
     fi
-    # Bound the per-character scan. Long visible text keeps the raw command.
-    total=$((total + ${#text}))
-    [ "${#text}" -le 4096 ] && [ "$total" -le 16384 ] || return 1
-    _shq_scan "$text" || return 1
-    [ "${is_start[idx]}" -eq 1 ] || continue
-    _shq_word_end || return 1
-    # The receiver must be a plain top-level command: not inside quotes, a
-    # substitution, a group, a function body or a compound command whose
-    # output a later word can redirect.
-    [ -z "$_shq_sq" ] && [ -z "$_shq_stk" ] && [ "$_shq_k" -eq 0 ] || return 1
-    _shq_receiver_ok "$_shq_seg" "${hrest[idx]}" || return 1
-    _shq_seg=""
-    _shq_cmdstart=1
+    # Any other visible text (a second command, a continuation, a second
+    # heredoc) keeps the raw command.
+    case "${lines[idx]}" in *[![:space:]]*) return 1 ;; esac
   done
-  _shq_word_end || return 1
-  [ -z "$_shq_sq" ] && [ -z "$_shq_stk" ] && [ "$_shq_k" -eq 0 ] || return 1
-  _shq_out+="$_shq_seg"
-  # The rest of the command must not reach a body through an expansion, a
-  # glob, a pipe, a process substitution, or a changed command lookup.
-  flat="${_shq_out//\"/}"
-  flat="${flat//\'/}"
-  flat="${flat//\\/}"
-  case "$flat" in
-    *'$'*|*'`'*|*'*'*|*'?'*|*'['*|*'{'*|*'<('*|*'>('*) return 1 ;;
-  esac
-  np="${_shq_out//||/}"
-  np="${np//>|/}"
-  case "$np" in *'|'*) return 1 ;; esac
-  if [[ "$_shq_out" =~ $env_re ]]; then return 1; fi
-  if [[ "$_shq_out" =~ \([[:space:]]*\) ]]; then return 1; fi
-  # When a sink writes a file (#1805, #1829 N1), every top-level command
-  # must be on the _shq_cmds_ok allow-list, so no command reads the file by
-  # an implicit name. A command that names the file may use it only as a
-  # --body-file, -F, --file, --input or --notes-file value or an rm
-  # argument. Otherwise keep the raw command.
-  if [ "${#_SHQ_FILES[@]}" -gt 0 ]; then
-    _shq_cmds_ok "$flat" || return 1
-  fi
-  for b in ${_SHQ_FILES[@]+"${_SHQ_FILES[@]}"}; do
-    _shq_file_uses_ok "$flat" "$b" || return 1
-  done
-  return 0
+  [ "$start" -ge 0 ] || return 1
+  _shq_single_sink "${prefix[start]}" "${hrest[start]}"
 }
 
 strip_heredoc_bodies() {
@@ -763,8 +422,19 @@ strip_heredoc_bodies() {
     # whose delimiter the pattern did not match (a digit or an escaped
     # name). Its body and the text up to the marker would be lost, so
     # return the raw command (fail closed).
+    # #1829 B1b: check the logical line. Join each earlier line that ends
+    # in a backslash, because bash removes a backslash-newline before it
+    # reads operators.
     if [ "$mode" = quoted ]; then
-      case "${cur%%"$marker"*}" in
+      local lpre="${cur%%"$marker"*}" pj=$((i - 1))
+      while [ "$pj" -ge 0 ] && [ "${skip[pj]}" -eq 0 ]; do
+        case "${lines[pj]}" in
+          *\\) lpre="${lines[pj]%\\}$lpre" ;;
+          *) break ;;
+        esac
+        pj=$((pj - 1))
+      done
+      case "$lpre" in
         *'<<'*) printf '%s' "$cmd"; return 0 ;;
       esac
     fi
@@ -834,8 +504,7 @@ strip_heredoc_bodies() {
     # Confirmed: lines i+1..j are body+terminator — drop them. Line i keeps
     # only whatever precedes the heredoc operator (it may hold a real
     # command, e.g. `cd foo && cat > x.txt <<EOF`).
-    # The prefix ends at the matched marker, so _shq_scan sees any
-    # earlier `<<` on the line (#1805 B1).
+    # In quoted mode the prefix ends at the matched marker (#1805 B1).
     if [ "$mode" = quoted ]; then
       prefix[i]="${cur%%"$marker"*}"
     else
@@ -864,8 +533,8 @@ strip_heredoc_bodies() {
   done
 
   # #1780 / #1805 (AgDR-0262): in quoted mode, keep the stripped text only
-  # when every stripped body feeds an allow-listed data sink. Any other
-  # receiver, or any parse doubt, returns the raw command (fail closed).
+  # when the whole command is one allow-listed data sink. Anything else,
+  # or any parse doubt, returns the raw command (fail closed).
   if [ "$mode" = quoted ] && [ "$stripped_any" -eq 1 ]; then
     if ! _shq_sinks_ok; then
       printf '%s' "$cmd"
