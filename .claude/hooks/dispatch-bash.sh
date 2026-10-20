@@ -494,11 +494,13 @@ esac
 # the subcommand, so `git push;`, `git push&&` and `(git push)` also route.
 #
 # The scan adds routing when its join succeeds. If awk fails, run the push
-# and commit gates unconditionally. #1780 / AgDR-0262: strip confirmed
-# quoted heredoc bodies before push/commit routing so prose mentions do
-# not start those gates. Keep the raw command for the merge-shape scan and
-# for the alias check. If the strip fails, run both gate groups (fail
-# closed). Unquoted heredocs and here-strings are not stripped here.
+# and commit gates unconditionally. #1780 / AgDR-0262: strip a confirmed
+# quoted heredoc body before push/commit routing only when its receiver is
+# an allow-listed data sink, so prose mentions do not start those gates.
+# Any other receiver keeps the raw command. The alias check and push/commit
+# routing read the stripped text. The merge-shape scan reads the raw
+# command. If the strip fails, run both gate groups (fail closed).
+# Unquoted heredocs and here-strings are not stripped here.
 #
 # Line continuations are joined first, because grep reads one line at a
 # time and `git \<newline> push` would otherwise put git and push on
@@ -632,7 +634,8 @@ if [ -z "$COMMAND" ]; then
   fi
   if raw_payload_command_matches "$INPUT" "$(git_subcommand_payload_pattern '(-c[[:space:]]+[^[:space:]]*[Aa][Ll][Ii][Aa][Ss]\.[^[:space:]]+|--config-env)')" \
     || raw_payload_command_matches "$INPUT" "$(git_subcommand_payload_pattern push)" \
-    || raw_payload_command_matches "$INPUT" "$(git_subcommand_payload_pattern commit)"; then
+    || raw_payload_command_matches "$INPUT" "$(git_subcommand_payload_pattern commit)" \
+    || raw_payload_command_matches "$INPUT" "$(git_redir_uncertain_payload_pattern)"; then
     echo "BLOCKED: dispatcher cannot parse this git command. Restore jq and retry." >&2
     exit 2
   fi

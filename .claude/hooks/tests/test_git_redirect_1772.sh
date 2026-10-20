@@ -32,10 +32,26 @@ cases_push=(
   "git</dev/null push origin feature/GH-1805-x"
   "git -C /tmp >/dev/null push origin feature/GH-1805-x"
   "git >/dev/null -C /tmp push origin feature/GH-1805-x"
+  # #1805 B2: a quoted target with a space, or a substitution target.
+  'git >"a b" push origin feature/GH-1805-x'
+  "git 2>'my log' push origin feature/GH-1805-x"
+  'git >"$OUT/a b" push origin feature/GH-1805-x'
+  'git >$(mktemp -d)/x push origin feature/GH-1805-x'
+  'git -C /tmp 2>"e r" push origin feature/GH-1805-x'
 )
 cases_commit=(
   "git >/dev/null commit -m x"
   "git 2>/dev/null commit -m x"
+  'git >"a b" commit -m x'
+  'git 2>$(mktemp) commit -m x'
+  'git >"a\" b" commit -m x'
+)
+# #1805 B2: a target that the shared grammar cannot match (nested
+# substitution, escaped quote) must still reach the gates, which block it.
+cases_uncertain=(
+  'git >$(a $(b c)) push origin feature/GH-1805-x'
+  'git >"$(echo "a b")" push origin feature/GH-1805-x'
+  'git >"$(printf ")")" commit -m x'
 )
 
 # Fail-before: archive the hooks tree at a pinned dev commit. The pin is the
@@ -116,6 +132,21 @@ for cmd in "${cases_commit[@]}"; do
   fi
 done
 
+for cmd in "${cases_uncertain[@]}"; do
+  if /bin/bash -c '. "$1" || exit 1; git_uncertain_protected_shape "$2"' _ "$HOOKS/_lib-git-global.sh" "$cmd"; then
+    pass "unparsed target fails closed: $cmd"
+  else
+    fail "unparsed target fails closed: $cmd"
+  fi
+done
+# Allow twin: a consumable target with a later prose word is not uncertain.
+twin='git log > "$OUT/a b.txt" && grep commit "$OUT/a b.txt"'
+if /bin/bash -c '. "$1" || exit 1; git_uncertain_protected_shape "$2"' _ "$HOOKS/_lib-git-global.sh" "$twin"; then
+  fail "consumable target is not uncertain: $twin"
+else
+  pass "consumable target is not uncertain: $twin"
+fi
+
 # `git > push` writes to a file named push; it is not a push verb.
 if has_in "$HOOKS/_lib-git-global.sh" "git > push" push; then
   fail "file-named push is not a verb"
@@ -175,6 +206,33 @@ if grep -qx 'check-secrets.sh' "$TMP/log" && grep -qx 'validate-commit-format.sh
 else
   fail "dispatcher routes commit gates for redirect commit"
   cat "$TMP/log" >&2 || true
+fi
+
+# #1805 B2 through the dispatcher: a quoted target with a space and an
+# unparsed nested target both reach the push gates.
+for cmd in 'git >"a b" push origin feature/GH-1805-x' 'git >$(a $(b c)) push origin feature/GH-1805-x'; do
+  payload=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","tool_input":{"command":sys.argv[1]}}))' "$cmd")
+  : > "$TMP/log"
+  printf '%s' "$payload" | DISPATCH_LOG="$TMP/log" "$TMP/hooks/dispatch-bash.sh" >/dev/null
+  if grep -qx 'block-main-push.sh' "$TMP/log" && grep -qx 'validate-branch-name.sh' "$TMP/log"; then
+    pass "dispatcher routes push gates: $cmd"
+  else
+    fail "dispatcher routes push gates: $cmd"
+    cat "$TMP/log" >&2 || true
+  fi
+done
+
+# The visitor blocks the unparsed target (real block-main-push gate).
+cp "$HOOKS/block-main-push.sh" "$TMP/real-bmp.sh"
+for lib in "$HOOKS"/_lib-*.sh; do cp "$lib" "$TMP/"; done
+payload=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","tool_input":{"command":sys.argv[1]},"cwd":sys.argv[2]}))' \
+  'git >$(a $(b c)) push origin feature/GH-1805-x' "$TMP")
+rc=0
+out=$(printf '%s' "$payload" | /bin/bash "$TMP/real-bmp.sh" 2>&1) || rc=$?
+if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q 'redirection hides'; then
+  pass "push gate blocks an unparsed redirection target"
+else
+  fail "push gate blocks an unparsed redirection target (rc=$rc): $(printf '%s' "$out" | head -2)"
 fi
 
 echo "TOTAL $PASS passed; $FAIL failed"

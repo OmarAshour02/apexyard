@@ -345,6 +345,130 @@ if runner_bad:
 else:
     ok(f"quoted body run by a shell/eval/source routes push gates ({len(runner_shapes)} shapes)")
 
+# #1805 B1 (CEO decision 2026-10-20): quoted mode strips a body only for an
+# allow-listed data sink. Every other receiver keeps the raw command, so the
+# push gates still see the body. Placeholder shapes, one per class.
+w_sys = "sys" + "tem"
+w_dot = "."
+b1_shapes = [
+    ("other-shell-tcsh", f"tcsh <<'EOF'\n{real_push}\nEOF"),
+    ("other-shell-csh-s", f"/bin/csh -s <<'EOF'\n{real_push}\nEOF"),
+    ("other-shell-fish", f"fish <<'EOF'\n{real_push}\nEOF"),
+    ("interp-python", f"python3 - <<'EOF'\nimport os\nos.{w_sys}('{real_push}')\nEOF"),
+    ("interp-perl", f"perl <<'EOF'\n{w_sys}('{real_push}');\nEOF"),
+    ("interp-ruby", f"ruby <<'EOF'\n{w_sys}('{real_push}')\nEOF"),
+    ("interp-node", f"node <<'EOF'\nrequire('child_process').execSync('{real_push}')\nEOF"),
+    ("dot-in-if-then", f"if true; then {w_dot} /dev/stdin <<'EOF'\n{real_push}\nEOF\nfi"),
+    ("dot-in-while-do", f"while true; do {w_dot} /dev/stdin <<'EOF'\n{real_push}\nEOF\nbreak; done"),
+    ("backslash-dot", f"\\{w_dot} /dev/stdin <<'EOF'\n{real_push}\nEOF"),
+    ("quoted-dot", f"'{w_dot}' /dev/stdin <<'EOF'\n{real_push}\nEOF"),
+    ("shell-var-s", f"\"$SHELL\" -s <<'EOF'\n{real_push}\nEOF"),
+    ("backslash-split-shell", f"ba\\sh <<'EOF'\n{real_push}\nEOF"),
+    ("quote-split-shell", f"b''ash <<'EOF'\n{real_push}\nEOF"),
+    ("script-written-then-run", f"cat > /tmp/s1805.sh <<'EOF'\n{real_push}\nEOF\nbash /tmp/s1805.sh"),
+    ("script-written-then-exec", f"cat > /tmp/s1805.sh <<'EOF'\n{real_push}\nEOF\nchmod +x /tmp/s1805.sh && /tmp/s1805.sh"),
+    ("tee-then-run", f"tee /tmp/s1805.sh <<'EOF'\n{real_push}\nEOF\nsh /tmp/s1805.sh"),
+    ("pipe-into-shell", f"cat <<'EOF' | sh\n{real_push}\nEOF"),
+    ("group-piped", f"{{ cat <<'EOF'\n{real_push}\nEOF\n}} | bash"),
+    ("function-cat", f"cat() {{ bash; }}; cat <<'EOF'\n{real_push}\nEOF"),
+    ("xargs", f"xargs -0 bash -c <<'EOF'\n{real_push}\nEOF"),
+    ("env-wrapper", f"env bash <<'EOF'\n{real_push}\nEOF"),
+]
+b1_bad = []
+for label, cmd in b1_shapes:
+    payload = tmp / f"b1-{label}.json"
+    payload.write_text(json.dumps({
+        "tool_name": "Bash",
+        "tool_input": {"command": cmd},
+        "cwd": str(tmp),
+    }))
+    log = tmp / f"log-b1-{label}"
+    log.write_text("")
+    env["DISPATCH_LOG"] = str(log)
+    subprocess.run(
+        ["/bin/bash", str(new_route / "dispatch-bash.sh")],
+        input=payload.read_text(),
+        text=True,
+        capture_output=True,
+        cwd=str(tmp),
+        env=env,
+        check=False,
+    )
+    if "block-main-push.sh" not in log.read_text():
+        b1_bad.append(label)
+if b1_bad:
+    bad("non-sink receiver must route push gates: " + ",".join(b1_bad))
+else:
+    ok(f"non-sink receivers route push gates ({len(b1_shapes)} shapes)")
+
+# Allow-listed data sinks: a prose body that names a push does not route the
+# push gates. Each sink has a block twin that must still route them.
+prose = f"Review note: run {real_push} after the merge."
+w_gh = "g" + "h"
+sink_pairs = [
+    ("cat-redirect",
+     f"cat > /tmp/r1805.md <<'EOF'\n{prose}\nEOF",
+     f"cat > /tmp/r1805.md <<'EOF'\n{real_push}\nEOF\nsh /tmp/r1805.md"),
+    ("cat-append",
+     f"cat >> /tmp/r1805.md <<'EOF'\n{prose}\nEOF",
+     f"cat >> /tmp/r1805.md <<'EOF'\n{real_push}\nEOF\n. /tmp/r1805.md"),
+    ("cat-noclobber",
+     f"cat >| /tmp/r1805.md <<'EOF'\n{prose}\nEOF",
+     f"cat >| /tmp/r1805.md <<'EOF'\n{real_push}\nEOF\nbash < /tmp/r1805.md"),
+    ("cat-alone",
+     f"cat <<'EOF'\n{prose}\nEOF",
+     f"cat <<'EOF' | bash\n{real_push}\nEOF"),
+    ("cat-pipe-tee",
+     f"cat <<'EOF' | tee -a /tmp/r1805.md\n{prose}\nEOF",
+     f"cat <<'EOF' | tee /tmp/r1805.md | sh\n{real_push}\nEOF"),
+    ("tee-files",
+     f"tee /tmp/a1805.md /tmp/b1805.md <<'EOF' >/dev/null\n{prose}\nEOF",
+     f"tee >(sh) <<'EOF'\n{real_push}\nEOF"),
+    ("host-body-file",
+     f"{w_gh} pr comment 1 --body-file - <<'EOF'\n{prose}\nEOF",
+     f"{w_gh} pr comment 1 --body-file - <<'EOF'\n{real_push}\nEOF\n{w_gh} pr view 1 --json body -q .body | sh"),
+    ("host-dash-F",
+     f"{w_gh} issue comment 1 -F - <<'EOF'\n{prose}\nEOF",
+     f"{w_gh} alias-x 1 -F - <<'EOF'\n{real_push}\nEOF"),
+    ("host-input",
+     f"{w_gh} api repos/o/r/issues/1/comments --input - <<'EOF'\n{prose}\nEOF",
+     f"{w_gh} api repos/o/r/issues/1/comments --input /tmp/x <<'EOF'\n{real_push}\nEOF"),
+    ("git-commit-F",
+     f"git {verb_commit} -F - <<'EOF'\nfeat(#1805): note\n\n{prose}\nEOF",
+     f"git -c core.editor=sh {verb_commit} -e -F - <<'EOF'\n{real_push}\nEOF"),
+    ("git-notes-F",
+     f"git notes add -F - <<'EOF'\n{prose}\nEOF",
+     f"git notes edit <<'EOF'\n{real_push}\nEOF"),
+]
+sink_bad = []
+for label, allow_cmd, twin_cmd in sink_pairs:
+    for kind, cmd in (("allow", allow_cmd), ("twin", twin_cmd)):
+        payload = tmp / f"sink-{label}-{kind}.json"
+        payload.write_text(json.dumps({
+            "tool_name": "Bash",
+            "tool_input": {"command": cmd},
+            "cwd": str(tmp),
+        }))
+        log = tmp / f"log-sink-{label}-{kind}"
+        log.write_text("")
+        env["DISPATCH_LOG"] = str(log)
+        subprocess.run(
+            ["/bin/bash", str(new_route / "dispatch-bash.sh")],
+            input=payload.read_text(),
+            text=True,
+            capture_output=True,
+            cwd=str(tmp),
+            env=env,
+            check=False,
+        )
+        routed = "block-main-push.sh" in log.read_text()
+        if (kind == "allow" and routed) or (kind == "twin" and not routed):
+            sink_bad.append(f"{label}-{kind}")
+if sink_bad:
+    bad("data-sink allow / twin routing: " + ",".join(sink_bad))
+else:
+    ok(f"data sinks strip prose and block twins route ({len(sink_pairs)} pairs)")
+
 # Allow twin: runner words only inside the quoted prose body do not route.
 twin_cmd = (
     "cat > /tmp/notes.md <<'EOF'\n"
