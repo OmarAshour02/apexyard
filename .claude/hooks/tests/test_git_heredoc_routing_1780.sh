@@ -373,6 +373,66 @@ if "block-main-push.sh" in log.read_text():
 else:
     ok("runner words inside quoted prose do not route push gates")
 
+# Review-body class (#1805, seen after #1804 merged): a quoted heredoc body
+# holds an unresolvable cd and a git verb that is not a builtin (an alias
+# candidate) in prose. In the original body, the verb word was
+# "hash-object" with its closing backtick. The alias check must not scan
+# that body. The block twin runs the same words outside the heredoc, so the
+# alias check still cannot resolve the repo.
+w_git = "g" + "it"
+w_cd = "c" + "d"
+w_hash = "hash" + "-object"
+w_verb = "zf" + "rob"
+w_out = '"$' + 'OUT"'
+review_body = (
+    f"Line 143 is `paths=$({w_cd} {w_out} && find . -print)`.\n"
+    f"The reviewer hook blocked `{w_git} {w_hash}` on an export.\n"
+    f"Then run {w_git} {w_verb} on the snapshot.\n"
+)
+alias_allow_cmd = f"cat > /tmp/review-1805.md <<'EOF'\n{review_body}EOF"
+alias_block_cmd = f"{w_cd} {w_out} && {w_git} {w_verb}"
+
+def dispatch_route(tree, cmd, tag):
+    payload = tmp / f"{tag}.json"
+    payload.write_text(json.dumps({
+        "tool_name": "Bash",
+        "tool_input": {"command": cmd},
+        "cwd": str(tmp),
+    }))
+    log = tmp / f"log-{tag}"
+    log.write_text("")
+    env["DISPATCH_LOG"] = str(log)
+    p = subprocess.run(
+        ["/bin/bash", str(tree / "dispatch-bash.sh")],
+        input=payload.read_text(),
+        text=True,
+        capture_output=True,
+        cwd=str(tmp),
+        env=env,
+        check=False,
+    )
+    return p.returncode, p.stdout + p.stderr
+
+rc, out = dispatch_route(new_route, alias_allow_cmd, "alias-allow")
+if rc == 0 and "BLOCKED" not in out:
+    ok("quoted review body with cd and git verbs in prose is allowed")
+else:
+    bad(f"quoted review body with cd and git verbs in prose is allowed; rc={rc} out={out[:240]!r}")
+rc, out = dispatch_route(new_route, alias_block_cmd, "alias-block")
+if rc == 2 and "cannot resolve the repository for this git alias" in out:
+    ok("same cd and git verb outside the heredoc still block")
+else:
+    bad(f"same cd and git verb outside the heredoc still block; rc={rc} out={out[:240]!r}")
+if fb_note:
+    print(f"NOTE: skip fail-before (review body): {fb_note}", flush=True)
+else:
+    base_route = make_dispatch_tree(base_hooks, "base-route", stub_gates=True)
+    rc, out = dispatch_route(base_route, alias_allow_cmd, "alias-allow-base")
+    if rc == 2 and "git alias" in out:
+        ok("fail-before: base blocks the quoted review body")
+    else:
+        bad(f"fail-before: base blocks the quoted review body; rc={rc} out={out[:240]!r}")
+
 # Length cap fail-closed.
 script = r'''
 set -eu
