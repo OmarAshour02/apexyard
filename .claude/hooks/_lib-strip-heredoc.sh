@@ -185,19 +185,51 @@ _shq_redir() {
 }
 
 # Check one file target word and record its base name in _SHQ_FILES.
-# /dev/null, /dev/stdout and /dev/stderr are not files.
+# /dev/null, /dev/stdout and /dev/stderr are not files. This is an
+# allow-list (#1829 A1): the target must be a plain relative or absolute
+# path. No part of it may name a git dir or a hooks dir, and its resolved
+# directory must not be inside a git dir or the configured hooks path.
+# Any doubt returns 1.
 _shq_target() {
-  local t="$1" b
+  local t="$1" b d lc part rd gd hp
   case "$t" in ''|*\\*) return 1 ;; esac
   t="${t//\"/}"
   t="${t//\'/}"
   case "$t" in
     /dev/null|/dev/stdout|/dev/stderr) return 0 ;;
-    /dev/*|/proc/*|.git/*|*/.git/*|hooks/*|*/hooks/*) return 1 ;;
   esac
+  [[ "$t" =~ ^[A-Za-z0-9._+%@,=/-]+$ ]] || return 1
+  case "$t" in -*|*/) return 1 ;; esac
+  lc="$(printf '%s' "$t" | tr '[:upper:]' '[:lower:]')"
+  local IFS=/
+  for part in $lc; do
+    case "$part" in
+      ..|.git|.git?*|.husky|hooks|.hooks|githooks) return 1 ;;
+    esac
+  done
+  unset IFS
+  case "$lc" in /dev/*|/proc/*|/sys/*) return 1 ;; esac
   b="${t##*/}"
-  [[ "$b" =~ ^[A-Za-z0-9._+%@,=-]+$ ]] || return 1
-  case "$b" in .|..) return 1 ;; esac
+  case "$b" in ''|.|..) return 1 ;; esac
+  d="."
+  case "$t" in */*) d="${t%/*}"; [ -n "$d" ] || d=/ ;; esac
+  rd="$(cd -P -- "$d" 2>/dev/null && pwd -P)" || return 1
+  [ -n "$rd" ] || return 1
+  if gd="$(git -C "$rd" rev-parse --absolute-git-dir 2>/dev/null)" && [ -n "$gd" ]; then
+    gd="$(cd -P -- "$gd" 2>/dev/null && pwd -P)" || return 1
+    case "$rd/" in "$gd"/*) return 1 ;; esac
+    hp="$(git -C "$rd" config --get core.hooksPath 2>/dev/null)" || hp=""
+    if [ -n "$hp" ]; then
+      case "$hp" in
+        /*) ;;
+        *) hp="$(git -C "$rd" rev-parse --show-toplevel 2>/dev/null)/$hp" ;;
+      esac
+      if [ -d "$hp" ]; then
+        hp="$(cd -P -- "$hp" 2>/dev/null && pwd -P)" || return 1
+        case "$rd/" in "$hp"/*) return 1 ;; esac
+      fi
+    fi
+  fi
   _SHQ_FILES+=("$b")
   return 0
 }
@@ -679,6 +711,16 @@ strip_heredoc_bodies() {
       esac
     fi
 
+    # #1805 B1: in quoted mode, an earlier `<<` on this line is a heredoc
+    # whose delimiter the pattern did not match (a digit or an escaped
+    # name). Its body and the text up to the marker would be lost, so
+    # return the raw command (fail closed).
+    if [ "$mode" = quoted ]; then
+      case "${cur%%"$marker"*}" in
+        *'<<'*) printf '%s' "$cmd"; return 0 ;;
+      esac
+    fi
+
     # --- Anchor check -------------------------------------------------
     # Everything after the matched delimiter word, on the SAME line, must
     # be empty / a comment / a plain redirection. Anything else (a closing
@@ -744,7 +786,13 @@ strip_heredoc_bodies() {
     # Confirmed: lines i+1..j are body+terminator — drop them. Line i keeps
     # only whatever precedes the heredoc operator (it may hold a real
     # command, e.g. `cd foo && cat > x.txt <<EOF`).
-    prefix[i]="${cur%%<<*}"
+    # The prefix ends at the matched marker, so _shq_scan sees any
+    # earlier `<<` on the line (#1805 B1).
+    if [ "$mode" = quoted ]; then
+      prefix[i]="${cur%%"$marker"*}"
+    else
+      prefix[i]="${cur%%<<*}"
+    fi
     hrest[i]="$rest"
     is_start[i]=1
     stripped_any=1

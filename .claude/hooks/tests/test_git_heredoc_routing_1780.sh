@@ -497,6 +497,50 @@ if "block-main-push.sh" in log.read_text():
 else:
     ok("runner words inside quoted prose do not route push gates")
 
+# #1829 B1: an earlier heredoc on the start line whose delimiter the
+# pattern does not match (a digit or an escaped name). The text between the
+# two `<<` must not be lost. A1: a cat or tee target in a hooks directory
+# keeps the raw command. Each case must route its gate; the allow twin not.
+real_commit = f"git {verb_commit} -m wip"
+q = "'"
+def route_log(cmd, tag):
+    (tmp / f"{tag}.json").write_text(json.dumps({
+        "tool_name": "Bash",
+        "tool_input": {"command": cmd},
+        "cwd": str(tmp),
+    }))
+    lg = tmp / f"log-{tag}"
+    lg.write_text("")
+    env["DISPATCH_LOG"] = str(lg)
+    subprocess.run(
+        ["/bin/bash", str(new_route / "dispatch-bash.sh")],
+        input=(tmp / f"{tag}.json").read_text(),
+        text=True,
+        capture_output=True,
+        cwd=str(tmp),
+        env=env,
+        check=False,
+    )
+    return lg.read_text()
+hid_shapes = [
+    ("digit-push", f"cat <<1; {real_push}; cat <<{q}EOF{q}\n1\nhello\nEOF", "block-main-push.sh"),
+    ("escaped-push", f"cat <<\\X; {real_push}; cat <<{q}EOF{q}\nX\nhello\nEOF", "block-main-push.sh"),
+    ("digit-commit", f"cat <<1; {real_commit}; cat <<{q}EOF{q}\n1\nhello\nEOF", "validate-commit-format.sh"),
+    ("escaped-commit", f"cat <<\\X; {real_commit}; cat <<{q}EOF{q}\nX\nhello\nEOF", "validate-commit-format.sh"),
+    ("husky-target", f"cat > .husky/pre-push <<{q}EOF{q}\n{real_push}\nEOF", "block-main-push.sh"),
+    ("githooks-tee", f"tee .githooks/pre-push <<{q}EOF{q}\n{real_push}\nEOF", "block-main-push.sh"),
+]
+hid_bad = [lb for lb, cmd, gate in hid_shapes if gate not in route_log(cmd, f"hid-{lb}")]
+if hid_bad:
+    bad("earlier heredoc / hooks target must route gates: " + ",".join(hid_bad))
+else:
+    ok(f"earlier heredoc and hooks targets route gates ({len(hid_shapes)} shapes)")
+hid_allow = f"cat <<{q}A{q} > /tmp/h1829.md\n{prose}\nA"
+if "block-main-push.sh" in route_log(hid_allow, "hid-allow"):
+    bad("allow twin: one quoted sink heredoc with prose must not route push gates")
+else:
+    ok("allow twin: one quoted sink heredoc with prose does not route push gates")
+
 # Review-body class (#1805, seen after #1804 merged): a quoted heredoc body
 # holds an unresolvable cd and a git verb that is not a builtin (an alias
 # candidate) in prose. In the original body, the verb word was
