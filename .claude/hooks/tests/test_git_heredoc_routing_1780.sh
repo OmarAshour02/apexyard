@@ -4,9 +4,9 @@
 # Bash heredoc that names push or commit verbs (that is the bug under test).
 set -eu
 # shellcheck source=/dev/null
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_test-session-isolation.sh"
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
 
-ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../../.." && pwd)
 HOOKS="$ROOT/.claude/hooks"
 PASS=0
 FAIL=0
@@ -85,30 +85,35 @@ real_push_cmd = (
     "cwd": str(tmp),
 }))
 
-# Fail-before: archive hooks from parent of first #1805 commit, else HEAD^ of step2.
-base_ref = os.environ.get("HEREDOC_1780_BASE_REF")
-if not base_ref:
-    out = subprocess.run(
-        ["git", "-C", str(root), "log", "--reverse", "--format=%H",
-         "--fixed-strings", "--grep=#1780"],
-        check=False, capture_output=True, text=True,
-    )
-    first = out.stdout.splitlines()[0] if out.stdout.strip() else ""
-    if first:
-        base_ref = subprocess.check_output(
-            ["git", "-C", str(root), "rev-parse", first + "^"],
-            text=True,
-        ).strip()
-    else:
-        # Before the #1780 fix commit: use current HEAD (step-1 tip).
-        base_ref = "HEAD"
-
-scratch = pathlib.Path(tempfile.mkdtemp(prefix="heredoc-1780-base-"))
-archive = subprocess.check_output(
-    ["git", "archive", base_ref, ".claude/hooks"], cwd=root
+# Fail-before: archive the hooks tree at a pinned dev commit. The pin is the
+# dev commit before #1805 (the #1804 squash). A squash merge keeps it on dev.
+# HEREDOC_1780_BASE_REF overrides the pin.
+FAIL_BEFORE_PIN = "5eb65c0f9cba2456c1a7fd41b56edc0a65f2c784"
+base_ref = os.environ.get("HEREDOC_1780_BASE_REF") or FAIL_BEFORE_PIN
+fb_note = ""
+have = subprocess.run(
+    ["git", "-C", str(root), "rev-parse", "--verify", "--quiet",
+     base_ref + "^{commit}"],
+    check=False, capture_output=True, text=True,
 )
-subprocess.run(["tar", "-x", "-C", str(scratch)], input=archive, check=True)
-base_hooks = scratch / ".claude/hooks"
+base_hooks = None
+if have.returncode != 0:
+    # Shallow CI clones can miss the pinned commit.
+    fb_note = f"pinned base {base_ref} is not in this clone"
+else:
+    # Inside tmp, so the shell EXIT trap removes it.
+    scratch = pathlib.Path(tempfile.mkdtemp(prefix="heredoc-1780-base-", dir=str(tmp)))
+    archive = subprocess.check_output(
+        ["git", "archive", base_ref, ".claude/hooks"], cwd=root
+    )
+    subprocess.run(["tar", "-x", "-C", str(scratch)], input=archive, check=True)
+    base_hooks = scratch / ".claude/hooks"
+    disp = base_hooks / "dispatch-bash.sh"
+    if not disp.is_file():
+        fb_note = "no base dispatch-bash.sh"
+    elif "APEXYARD_GIT_ROUTE_CMD" in disp.read_text():
+        # The base already has the fix, so it cannot show the old timeout.
+        fb_note = f"base {base_ref} already strips quoted heredocs"
 
 def run_dispatch(hooks_dir, payload_path, locale="en_US.UTF-8", timeout=20):
     env = dict(os.environ)
@@ -185,18 +190,21 @@ if not bash_link.exists():
 # Timing trees keep real push/commit gates. Routing trees stub the gates
 # so DISPATCH_LOG shows which groups ran.
 new_time = make_dispatch_tree(hooks, "new-time", stub_gates=False)
-base_time = make_dispatch_tree(base_hooks, "base-time", stub_gates=False)
 new_route = make_dispatch_tree(hooks, "new-route", stub_gates=True)
 
 # Fail-before: 16KB keyword body times out or exceeds 3s / falsely blocks.
-t0 = time.perf_counter()
-rc, out, note = run_dispatch(base_time, tmp / "kw.json", "en_US.UTF-8", timeout=25)
-base_dt = time.perf_counter() - t0
-base_bad = (rc == 124) or (base_dt > 3.0) or (rc == 2)
-if base_bad:
-    ok(f"fail-before kw 16KB base_dt={base_dt:.3f}s rc={rc} note={note}")
+if fb_note:
+    print(f"NOTE: skip fail-before: {fb_note}", flush=True)
 else:
-    bad(f"fail-before expected slow/block; base_dt={base_dt:.3f}s rc={rc} out={out[:200]!r}")
+    base_time = make_dispatch_tree(base_hooks, "base-time", stub_gates=False)
+    t0 = time.perf_counter()
+    rc, out, note = run_dispatch(base_time, tmp / "kw.json", "en_US.UTF-8", timeout=25)
+    base_dt = time.perf_counter() - t0
+    base_bad = (rc == 124) or (base_dt > 3.0) or (rc == 2)
+    if base_bad:
+        ok(f"fail-before kw 16KB base_dt={base_dt:.3f}s rc={rc} note={note}")
+    else:
+        bad(f"fail-before expected slow/block; base_dt={base_dt:.3f}s rc={rc} out={out[:200]!r}")
 
 # After-fix timing under UTF-8 and C (real gates; prose must not block).
 # One warm-up run, then three timed runs. Every timed sample must be <= 3s.

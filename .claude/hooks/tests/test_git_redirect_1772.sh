@@ -1,11 +1,11 @@
 #!/bin/bash
 # #1772 / #1805 step 1: redirections before the git verb still route.
-# Fail-before uses the hooks tree at ALIAS_1748 / branch base when set.
+# Fail-before uses the hooks tree at a pinned dev commit (build rule 10a).
 set -eu
 # shellcheck source=/dev/null
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_test-session-isolation.sh"
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
 
-ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../../.." && pwd)
 HOOKS="$ROOT/.claude/hooks"
 PASS=0
 FAIL=0
@@ -38,29 +38,35 @@ cases_commit=(
   "git 2>/dev/null commit -m x"
 )
 
-# Fail-before: archive the branch base (parent of first #1805 commit, or
-# REDIRECT_1772_BASE_HOOKS / REDIRECT_1772_BASE_REF).
+# Fail-before: archive the hooks tree at a pinned dev commit. The pin is the
+# dev commit before #1805 (the #1804 squash). A squash merge keeps it on dev.
+# REDIRECT_1772_BASE_HOOKS or REDIRECT_1772_BASE_REF overrides the pin.
+FAIL_BEFORE_PIN=5eb65c0f9cba2456c1a7fd41b56edc0a65f2c784
 BASE_HOOKS="${REDIRECT_1772_BASE_HOOKS:-}"
+fb_note=""
+scratch=""
+trap 'rm -rf "${scratch:-}"' EXIT
 if [ -z "$BASE_HOOKS" ]; then
-  BASE_REF="${REDIRECT_1772_BASE_REF:-}"
-  if [ -z "$BASE_REF" ]; then
-    # Oldest #1805 commit's parent (git log -1 + --reverse is not oldest).
-    first_1805=$(git -C "$ROOT" log --reverse --format=%H --fixed-strings --grep='#1805' 2>/dev/null | head -1 || true)
-    if [ -n "$first_1805" ]; then
-      BASE_REF=$(git -C "$ROOT" rev-parse "${first_1805}^")
-    else
-      # Uncommitted fix: compare against the last committed hooks tree.
-      BASE_REF=HEAD
-    fi
-  fi
-  if git -C "$ROOT" rev-parse --verify "$BASE_REF" >/dev/null 2>&1; then
+  BASE_REF="${REDIRECT_1772_BASE_REF:-$FAIL_BEFORE_PIN}"
+  if git -C "$ROOT" rev-parse --verify --quiet "${BASE_REF}^{commit}" >/dev/null 2>&1; then
     scratch=$(mktemp -d)
     git -C "$ROOT" archive "$BASE_REF" .claude/hooks | tar -x -C "$scratch"
     BASE_HOOKS="$scratch/.claude/hooks"
+  else
+    # Shallow CI clones can miss the pinned commit.
+    fb_note="pinned base ${BASE_REF} is not in this clone"
   fi
 fi
 
-if [ -n "${BASE_HOOKS:-}" ] && [ -f "$BASE_HOOKS/_lib-git-global.sh" ]; then
+if [ -z "$fb_note" ] && { [ -z "${BASE_HOOKS:-}" ] || [ ! -f "$BASE_HOOKS/_lib-git-global.sh" ]; }; then
+  fb_note="no base _lib-git-global.sh"
+fi
+if [ -z "$fb_note" ] && grep -q '_git_take_redir' "$BASE_HOOKS/_lib-git-global.sh"; then
+  # The base already has the fix, so it cannot show the old miss.
+  fb_note="base ${BASE_REF:-override} already skips redirections"
+fi
+
+if [ -z "$fb_note" ]; then
   fb_miss=0
   for cmd in "${cases_push[@]}"; do
     if has_in "$BASE_HOOKS/_lib-git-global.sh" "$cmd" push; then
@@ -80,7 +86,7 @@ if [ -n "${BASE_HOOKS:-}" ] && [ -f "$BASE_HOOKS/_lib-git-global.sh" ]; then
     pass "fail-before: ${fb_miss} redirect cases miss routing on base"
   fi
 else
-  echo "WARN: no base hooks for fail-before; skipped" >&2
+  echo "NOTE: skip fail-before: ${fb_note}"
 fi
 
 # After-fix: current library routes every redirect case.
