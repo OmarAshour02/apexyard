@@ -99,10 +99,13 @@
 #   quoted  — strip only heredocs whose delimiter is quoted (`<<'EOF'` /
 #             `<<"EOF"`). Used by the dispatcher for push/commit routing
 #             (#1780 / AgDR-0262). Unquoted heredocs and here-strings keep
-#             today's checks.
+#             today's checks. When the stripped text still runs a shell,
+#             eval, source or `.`, the raw command is returned unchanged,
+#             because that body is code.
 strip_heredoc_bodies() {
   local cmd="$1"
   local mode="${2:-all}"
+  local stripped_any=0
   local -a lines=()
   local line
   while IFS= read -r line || [ -n "$line" ]; do
@@ -219,6 +222,7 @@ strip_heredoc_bodies() {
     # command, e.g. `cd foo && cat > x.txt <<EOF`).
     prefix[i]="${cur%%<<*}"
     is_start[i]=1
+    stripped_any=1
     local k
     for ((k = i + 1; k <= j; k++)); do
       skip[k]=1
@@ -237,6 +241,26 @@ strip_heredoc_bodies() {
       out+="${lines[idx]}"$'\n'
     fi
   done
+
+  # #1780 / #1805: a quoted body that a shell, eval or source runs is code,
+  # not data (`bash <<'EOF'`, `eval "$(cat <<'EOF'`, `x=$(cat <<'EOF' ...);
+  # eval "$x"`). When the stripped text still names one of these runners,
+  # return the raw command so every gate sees the body. A grep error also
+  # returns the raw command (fail closed).
+  if [ "$mode" = quoted ] && [ "$stripped_any" -eq 1 ]; then
+    local runner_re rc
+    runner_re='(^|[^[:alnum:]_.-])(sh|bash|zsh|dash|ksh|eval|source)([^[:alnum:]_.-]|$)'
+    runner_re+='|(^|[;&|(){}!])[[:space:]]*[.][[:space:]]+[^[:space:]]'
+    if printf '%s\n' "$out" | LC_ALL=C grep -qE "$runner_re"; then
+      rc=0
+    else
+      rc=$?
+    fi
+    if [ "$rc" -ne 1 ]; then
+      printf '%s' "$cmd"
+      return 0
+    fi
+  fi
 
   printf '%s' "$out"
 }

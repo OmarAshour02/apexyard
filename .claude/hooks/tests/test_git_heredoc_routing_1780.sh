@@ -307,6 +307,72 @@ if "block-main-push.sh" in log.read_text():
 else:
     bad("here-string still routes push gates")
 
+# A quoted body that a shell, eval or source runs is code, not data.
+# Each shape must still reach the push gates (#1805 rebase onto #1804 r4).
+real_push = f"git {verb_push} origin feature/GH-1805-x"
+runner_shapes = [
+    ("fed-bash", f"bash <<'EOF'\ncd /tmp && {real_push}\nEOF"),
+    ("fed-sh-s", f"/bin/sh -s <<'EOF'\n{real_push}\nEOF"),
+    ("eval-subst", f"eval \"$(cat <<'EOF'\n{real_push}\nEOF\n)\""),
+    ("eval-var", f"x=$(cat <<'EOF'\n{real_push}\nEOF\n); eval \"$x\""),
+    ("source-stdin", f"source /dev/stdin <<'EOF'\n{real_push}\nEOF"),
+    ("dot-stdin", f". /dev/stdin <<'EOF'\n{real_push}\nEOF"),
+]
+runner_bad = []
+for label, cmd in runner_shapes:
+    payload = tmp / f"runner-{label}.json"
+    payload.write_text(json.dumps({
+        "tool_name": "Bash",
+        "tool_input": {"command": cmd},
+        "cwd": str(tmp),
+    }))
+    log = tmp / f"log-runner-{label}"
+    log.write_text("")
+    env["DISPATCH_LOG"] = str(log)
+    subprocess.run(
+        ["/bin/bash", str(new_route / "dispatch-bash.sh")],
+        input=payload.read_text(),
+        text=True,
+        capture_output=True,
+        cwd=str(tmp),
+        env=env,
+        check=False,
+    )
+    if "block-main-push.sh" not in log.read_text():
+        runner_bad.append(label)
+if runner_bad:
+    bad("quoted body run by a shell/eval/source must route push gates: " + ",".join(runner_bad))
+else:
+    ok(f"quoted body run by a shell/eval/source routes push gates ({len(runner_shapes)} shapes)")
+
+# Allow twin: runner words only inside the quoted prose body do not route.
+twin_cmd = (
+    "cat > /tmp/notes.md <<'EOF'\n"
+    f"run bash or sh, then eval and source, then {real_push}\n"
+    "EOF"
+)
+(tmp / "runner-twin.json").write_text(json.dumps({
+    "tool_name": "Bash",
+    "tool_input": {"command": twin_cmd},
+    "cwd": str(tmp),
+}))
+log = tmp / "log-runner-twin"
+log.write_text("")
+env["DISPATCH_LOG"] = str(log)
+subprocess.run(
+    ["/bin/bash", str(new_route / "dispatch-bash.sh")],
+    input=(tmp / "runner-twin.json").read_text(),
+    text=True,
+    capture_output=True,
+    cwd=str(tmp),
+    env=env,
+    check=False,
+)
+if "block-main-push.sh" in log.read_text():
+    bad("runner words inside quoted prose must not route push gates")
+else:
+    ok("runner words inside quoted prose do not route push gates")
+
 # Length cap fail-closed.
 script = r'''
 set -eu

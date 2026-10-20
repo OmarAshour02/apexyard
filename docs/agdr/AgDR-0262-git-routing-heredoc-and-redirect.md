@@ -68,12 +68,19 @@ quoted heredoc on the gate path.
    for gate visitors. Run the dispatcher alias check on that stripped text
    so quoted heredoc prose is not scanned. Keep `COMMAND` raw for
    merge-shape matching. Gate-level `git_alias_check` in
-   `git_visit_invocations` still sees the raw JSON command.
+   `git_visit_invocations` reads the same stripped text.
 3. **Visit once** — `git_visit_invocations` matches on the stripped route text
    and warms/export the segment cache once per visit.
 4. **Linear segments** — `_git_chain_segments` uses `_run_awk_or_fallback` with
    the former Bash loop as fallback. Cap default 65536 bytes; above that,
    print a clear BLOCKED message and return 2.
+5. **Runner bodies stay code** — A quoted body that a shell, `eval`,
+   `source` or `.` runs is code, not data. Examples are `bash <<'EOF'`,
+   `eval "$(cat <<'EOF'`, and `x=$(cat <<'EOF' ...); eval "$x"`. In `quoted`
+   mode, when the stripped text still names one of these runners,
+   `strip_heredoc_bodies` returns the raw command unchanged. A grep error
+   also returns the raw command. The rebase onto #1804 round 4 found this
+   case (`G7-r4-shell-notes`).
 
 ## Consequences
 
@@ -81,6 +88,10 @@ quoted heredoc on the gate path.
   less (UTF-8 and `LC_ALL=C`) and does not route those gates.
 - A real push after `cd` and a quoted heredoc still reaches every push gate.
 - Unquoted heredocs and here-strings still route when they name the verbs.
+- A quoted body that a shell, `eval` or `source` runs still routes. A
+  command that also names a runner outside the body keeps the raw scan. That
+  scan can be slow for a large body, and a dispatcher timeout blocks (fail
+  closed).
 - Dispatcher and visitor alias checks use the stripped route text so quoted
   heredoc prose is not scanned. Real alias verbs outside those bodies still
   block. Merge-shape matching stays on the raw command.
