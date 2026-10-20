@@ -48,7 +48,7 @@ Stacked on AgDR-0253 / PR #1804.
   no whitespace stopped at a quoted target with a space or at a
   substitution target. The verb stayed hidden. The target unit is now one
   full shell word, and an unmatched target fails closed (Decision 1).
-- 2026-10-19 (AgDR-0259 / #1810): `validate-commit-format.sh` applies the same
+- 2026-10-19 (AgDR-0263 / #1810): `validate-commit-format.sh` applies the same
   quoted-stripped route text to presence, newline-compound, and backtick
   scans so a file-writing heredoc body is not mistaken for a commit.
 - 2026-10-20 (CEO decision: narrow to single-command sinks after 5 review

@@ -44,7 +44,7 @@ if [ -z "$COMMAND" ]; then
   exit 0
 fi
 
-# #1810 / AgDR-0259: a quoted heredoc body is data. Presence, newline-compound,
+# #1810 / AgDR-0263: a quoted heredoc body is data. Presence, newline-compound,
 # and backtick scans use the same stripped route text as push/commit routing
 # (AgDR-0262). Message extraction and the heredoc-substitution skip still
 # read the raw command so `$(cat <<…)` shapes stay visible.

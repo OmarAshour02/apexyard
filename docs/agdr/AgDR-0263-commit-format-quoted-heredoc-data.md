@@ -9,7 +9,7 @@
 
 ## Status
 
-Accepted. AgDR-0259. Implements me2resh/apexyard#1810.
+Accepted. AgDR-0263. Implements me2resh/apexyard#1810.
 Stacked on AgDR-0262 / #1805.
 
 ### Architecture evolution
@@ -47,7 +47,9 @@ the raw command.
 
 1. Prefer `APEXYARD_GIT_ROUTE_CMD` when the dispatcher set it.
 2. Else strip confirmed quoted heredoc bodies; fail closed if that strip
-   returns non-zero after a successful load.
+   returns non-zero after a successful load. The strip keeps a body only
+   when an allow-listed data sink receives it (AgDR-0262 Decision 5).
+   Every other receiver keeps the raw command, so this gate scans it.
 3. If the stripper file is absent, keep scanning the raw command (test
    sandboxes and sparse trees).
 4. Keep subject validation, `-F` reads, and the `$(cat <<…)` skip on the
